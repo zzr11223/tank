@@ -1,0 +1,15 @@
+..\Core\Src\mpu6500.c:61:14:FastAtan2	24	static
+..\Core\Src\mpu6500.c:81:14:FastSqrt	24	static
+..\Core\Src\mpu6500.c:234:13:ScheduleReinit	0	static
+..\Core\Src\mpu6500.c:121:26:ReadRegisterRetry	24	static
+..\Core\Src\mpu6500.c:110:26:WriteRegisterRetry	24	static
+..\Core\Src\mpu6500.c:241:9:MPU6500_Init	32	static
+..\Core\Src\mpu6500.c:305:9:MPU6500_ReadData	24	static
+..\Core\Src\mpu6500.c:327:6:MPU6500_Calibrate	72	static
+..\Core\Src\mpu6500.c:364:6:MPU6500_SetStationary	0	static
+..\Core\Src\mpu6500.c:373:9:MPU6500_Update	80	static
+..\Core\Src\mpu6500.c:485:9:MPU6500_IsReady	0	static
+..\Core\Src\mpu6500.c:491:9:MPU6500_GetReadFailures	0	static
+..\Core\Src\mpu6500.c:496:9:MPU6500_GetInitFailure	0	static
+..\Core\Src\mpu6500.c:501:9:MPU6500_GetLastWhoAmI	0	static
+..\Core\Src\mpu6500.c:506:10:MPU6500_GetLastI2cError	0	static

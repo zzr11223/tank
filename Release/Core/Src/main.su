@@ -1,0 +1,12 @@
+../Core/Src/main.c:299:13:CommitTrackPwm	0	static,ignoring_inline_asm
+../Core/Src/main.c:352:13:DisableYawHold	0	static
+../Core/Src/main.c:790:13:ResetTrackSpeedControl	0	static
+../Core/Src/main.c:323:13:RefreshInfraredInputs	24	static,ignoring_inline_asm
+../Core/Src/main.c:638:13:RcCaptureEdge	24	static
+../Core/Src/main.c:257:16:AngleToCentiDegrees	8	static
+../Core/Src/main.c:603:6:HAL_UART_RxCpltCallback	8	static
+../Core/Src/main.c:630:6:HAL_UART_ErrorCallback	0	static
+../Core/Src/main.c:1178:6:SystemClock_Config	72	static,ignoring_inline_asm
+../Core/Src/main.c:977:5:main	88	static,ignoring_inline_asm
+../Core/Src/main.c:1215:6:HAL_GPIO_EXTI_Callback	24	static
+../Core/Src/main.c:1276:6:Error_Handler	0	static,ignoring_inline_asm

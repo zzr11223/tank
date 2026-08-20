@@ -1,0 +1,6 @@
+..\Core\Src\spi.c:5:13:SPI2_ClearRxFlags	8	static
+..\Core\Src\spi.c:21:26:SPI2_TransferByte.part.0	24	static
+..\Core\Src\spi.c:50:26:SPI2_EndTransaction	16	static
+..\Core\Src\spi.c:66:6:MX_SPI2_Init	48	static
+..\Core\Src\spi.c:102:19:SPI2_ReadRegisters	24	static
+..\Core\Src\spi.c:132:19:SPI2_WriteRegister	24	static

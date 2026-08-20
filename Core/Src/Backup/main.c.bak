@@ -1,0 +1,515 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "tim.h"
+#include "usart.h"
+#include "gpio.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <string.h>
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+
+/* ----- 6通道 PWM 输入捕获 ----- */
+/* CH1: TIM3_CH1  PA6 */
+volatile uint32_t CH1_PulseWidth = 0;
+volatile uint32_t CH1_LastRise   = 0;
+volatile uint8_t  CH1_State      = 0;
+volatile uint32_t CH1_LastTick   = 0;
+
+/* CH2: TIM2_CH1  PA0 */
+volatile uint32_t CH2_PulseWidth = 0;
+volatile uint32_t CH2_LastRise   = 0;
+volatile uint8_t  CH2_State      = 0;
+volatile uint32_t CH2_LastTick   = 0;
+
+/* CH3: TIM2_CH4  PA3 */
+volatile uint32_t CH3_PulseWidth = 0;
+volatile uint32_t CH3_LastRise   = 0;
+volatile uint8_t  CH3_State      = 0;
+volatile uint32_t CH3_LastTick   = 0;
+
+/* CH4: TIM3_CH2  PA7 */
+volatile uint32_t CH4_PulseWidth = 0;
+volatile uint32_t CH4_LastRise   = 0;
+volatile uint8_t  CH4_State      = 0;
+volatile uint32_t CH4_LastTick   = 0;
+
+/* CH5: TIM3_CH3  PB0 */
+volatile uint32_t CH5_PulseWidth = 0;
+volatile uint32_t CH5_LastRise   = 0;
+volatile uint8_t  CH5_State      = 0;
+volatile uint32_t CH5_LastTick   = 0;
+
+/* CH6: TIM3_CH4  PB1 */
+volatile uint32_t CH6_PulseWidth = 0;
+volatile uint32_t CH6_LastRise   = 0;
+volatile uint8_t  CH6_State      = 0;
+volatile uint32_t CH6_LastTick   = 0;
+
+char dbg_buf[128];
+uint32_t LastDebugTick = 0;
+
+/*
+ * Tank drive mapping
+ *   CH2 / PA0 : left stick vertical, throttle command
+ *   CH1 / PA6 : right stick horizontal, steering command
+ *   PE9       : TIM1_CH1, right track ESC / motor controller
+ *   PE11      : TIM1_CH2, left track ESC / motor controller
+ *
+ * The motor controllers must accept bidirectional RC PWM: 1500 us is stop,
+ * 1000 us is full reverse, and 2000 us is full forward.
+ */
+#define RC_OUTPUT_MIN_US          1000
+#define RC_OUTPUT_CENTER_US       1500
+#define RC_OUTPUT_MAX_US          2000
+#define RC_INPUT_VALID_MIN_US      900
+#define RC_INPUT_VALID_MAX_US     2100
+#define RC_DEADBAND_US              25
+
+/* Set either value to 1 only if the corresponding physical direction is reversed. */
+#define TANK_THROTTLE_REVERSED       0
+#define TANK_STEERING_REVERSED       0
+#define TANK_RIGHT_TRACK_REVERSED    0
+#define TANK_LEFT_TRACK_REVERSED     0
+#define TANK_STEERING_PRIORITY       1
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+static int32_t ClampI32(int32_t value, int32_t minimum, int32_t maximum)
+{
+  if (value < minimum) return minimum;
+  if (value > maximum) return maximum;
+  return value;
+}
+
+/* Convert an RC pulse to a signed command around 0. Invalid/lost input stops. */
+static int32_t RcPulseToCommand(uint32_t pulse_us)
+{
+  int32_t command;
+
+  if ((pulse_us < RC_INPUT_VALID_MIN_US) || (pulse_us > RC_INPUT_VALID_MAX_US))
+  {
+    return 0;
+  }
+
+  command = (int32_t)pulse_us - RC_OUTPUT_CENTER_US;
+  if ((command >= -RC_DEADBAND_US) && (command <= RC_DEADBAND_US))
+  {
+    return 0;
+  }
+
+  return ClampI32(command,
+                  RC_OUTPUT_MIN_US - RC_OUTPUT_CENTER_US,
+                  RC_OUTPUT_MAX_US - RC_OUTPUT_CENTER_US);
+}
+
+static uint16_t CommandToRcPulse(int32_t command)
+{
+  command = ClampI32(command,
+                     RC_OUTPUT_MIN_US - RC_OUTPUT_CENTER_US,
+                     RC_OUTPUT_MAX_US - RC_OUTPUT_CENTER_US);
+  return (uint16_t)(RC_OUTPUT_CENTER_US + command);
+}
+
+/*
+ * Tank control. With steering priority enabled, any right-stick horizontal
+ * command drives the tracks in opposite directions, so it turns in place.
+ */
+static void UpdateTankDrive(uint32_t throttle_pulse_us, uint32_t steering_pulse_us)
+{
+  int32_t throttle = RcPulseToCommand(throttle_pulse_us);
+  int32_t steering = RcPulseToCommand(steering_pulse_us);
+  int32_t right_command;
+  int32_t left_command;
+
+#if TANK_THROTTLE_REVERSED
+  throttle = -throttle;
+#endif
+#if TANK_STEERING_REVERSED
+  steering = -steering;
+#endif
+
+  /* Positive steering: left track forward, right track reverse. */
+#if TANK_STEERING_PRIORITY
+  if (steering != 0)
+  {
+    right_command = -steering;
+    left_command  =  steering;
+  }
+  else
+  {
+    right_command = throttle;
+    left_command  = throttle;
+  }
+#else
+  right_command = throttle - steering;
+  left_command  = throttle + steering;
+#endif
+
+#if TANK_RIGHT_TRACK_REVERSED
+  right_command = -right_command;
+#endif
+#if TANK_LEFT_TRACK_REVERSED
+  left_command = -left_command;
+#endif
+
+  /* PE9 / TIM1_CH1 drives the right track; PE11 / TIM1_CH2 drives the left. */
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, CommandToRcPulse(right_command));
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, CommandToRcPulse(left_command));
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_USART1_UART_Init();
+  MX_TIM2_Init();
+  MX_TIM1_Init();
+  MX_TIM3_Init();
+  /* USER CODE BEGIN 2 */
+
+  /* 启动 TIM1 CH1/CH2 PWM 输出 */
+  /* Start both ESC/motor-controller outputs at their neutral pulse width. */
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, RC_OUTPUT_CENTER_US);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, RC_OUTPUT_CENTER_US);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+
+  /* 启动 TIM2 CH1/CH4 输入捕获 (CH2/CH3) */
+  HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
+  HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_4);
+
+  /* 启动 TIM3 CH1-4 输入捕获 (CH1/CH4/CH5/CH6) */
+  HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_1);
+  HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_2);
+  HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_3);
+  HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_4);
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    uint32_t now = HAL_GetTick();
+
+    /* 超过50ms没收到信号 → 失联保护，置0 */
+    if (now - CH1_LastTick > 50) CH1_PulseWidth = 0;
+    if (now - CH2_LastTick > 50) CH2_PulseWidth = 0;
+    if (now - CH3_LastTick > 50) CH3_PulseWidth = 0;
+    if (now - CH4_LastTick > 50) CH4_PulseWidth = 0;
+    if (now - CH5_LastTick > 50) CH5_PulseWidth = 0;
+    if (now - CH6_LastTick > 50) CH6_PulseWidth = 0;
+
+    /* CH2 is left-stick vertical throttle; CH1 is right-stick horizontal steering. */
+    UpdateTankDrive(CH2_PulseWidth, CH1_PulseWidth);
+
+    /* 6通道原始脉宽输出 (单位: us) */
+    /* Keep diagnostic output low rate so control updates are not delayed. */
+    if ((now - LastDebugTick) >= 100)
+    {
+      int n = sprintf(dbg_buf,
+          "CH1=%lu CH2=%lu CH3=%lu CH4=%lu CH5=%lu CH6=%lu\r\n",
+          (unsigned long)CH1_PulseWidth, (unsigned long)CH2_PulseWidth,
+          (unsigned long)CH3_PulseWidth, (unsigned long)CH4_PulseWidth,
+          (unsigned long)CH5_PulseWidth, (unsigned long)CH6_PulseWidth);
+      HAL_UART_Transmit(&huart1, (uint8_t *)dbg_buf, n, 20);
+      LastDebugTick = now;
+    }
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* USER CODE BEGIN 4 */
+
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+  uint32_t val;
+
+  /* ===== TIM2: CH2(PA0) / CH3(PA1) ===== */
+  if (htim->Instance == TIM2)
+  {
+    /* ---- CH2 (TIM2_CH1) ---- */
+    if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
+    {
+      val = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+      CH2_LastTick = HAL_GetTick();
+
+      if (CH2_State == 0)  /* 上升沿 */
+      {
+        CH2_LastRise = val;
+        CH2_State = 1;
+        MODIFY_REG(htim->Instance->CCER, TIM_CCER_CC1P, TIM_CCER_CC1P);
+      }
+      else  /* 下降沿 */
+      {
+        if (val >= CH2_LastRise)
+          CH2_PulseWidth = val - CH2_LastRise;
+        else
+          CH2_PulseWidth = 65535 - CH2_LastRise + val + 1;
+        CH2_State = 0;
+        MODIFY_REG(htim->Instance->CCER, TIM_CCER_CC1P, 0);
+      }
+    }
+
+    /* ---- CH3 (TIM2_CH4 / PA3) ---- */
+    if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_4)
+    {
+      val = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_4);
+      CH3_LastTick = HAL_GetTick();
+
+      if (CH3_State == 0)
+      {
+        CH3_LastRise = val;
+        CH3_State = 1;
+        MODIFY_REG(htim->Instance->CCER, TIM_CCER_CC4P, TIM_CCER_CC4P);
+      }
+      else
+      {
+        if (val >= CH3_LastRise)
+          CH3_PulseWidth = val - CH3_LastRise;
+        else
+          CH3_PulseWidth = 65535 - CH3_LastRise + val + 1;
+        CH3_State = 0;
+        MODIFY_REG(htim->Instance->CCER, TIM_CCER_CC4P, 0);
+      }
+    }
+    return;
+  }
+
+  /* ===== TIM3: CH1(PA6) / CH4(PA7) / CH5(PB0) / CH6(PB1) ===== */
+  if (htim->Instance == TIM3)
+  {
+    /* ---- CH1 (TIM3_CH1) ---- */
+    if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
+    {
+      val = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+      CH1_LastTick = HAL_GetTick();
+
+      if (CH1_State == 0)
+      {
+        CH1_LastRise = val;
+        CH1_State = 1;
+        MODIFY_REG(htim->Instance->CCER, TIM_CCER_CC1P, TIM_CCER_CC1P);
+      }
+      else
+      {
+        if (val >= CH1_LastRise)
+          CH1_PulseWidth = val - CH1_LastRise;
+        else
+          CH1_PulseWidth = 65535 - CH1_LastRise + val + 1;
+        CH1_State = 0;
+        MODIFY_REG(htim->Instance->CCER, TIM_CCER_CC1P, 0);
+      }
+    }
+
+    /* ---- CH4 (TIM3_CH2) ---- */
+    if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2)
+    {
+      val = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
+      CH4_LastTick = HAL_GetTick();
+
+      if (CH4_State == 0)
+      {
+        CH4_LastRise = val;
+        CH4_State = 1;
+        MODIFY_REG(htim->Instance->CCER, TIM_CCER_CC2P, TIM_CCER_CC2P);
+      }
+      else
+      {
+        if (val >= CH4_LastRise)
+          CH4_PulseWidth = val - CH4_LastRise;
+        else
+          CH4_PulseWidth = 65535 - CH4_LastRise + val + 1;
+        CH4_State = 0;
+        MODIFY_REG(htim->Instance->CCER, TIM_CCER_CC2P, 0);
+      }
+    }
+
+    /* ---- CH5 (TIM3_CH3) ---- */
+    if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_3)
+    {
+      val = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_3);
+      CH5_LastTick = HAL_GetTick();
+
+      if (CH5_State == 0)
+      {
+        CH5_LastRise = val;
+        CH5_State = 1;
+        MODIFY_REG(htim->Instance->CCER, TIM_CCER_CC3P, TIM_CCER_CC3P);
+      }
+      else
+      {
+        if (val >= CH5_LastRise)
+          CH5_PulseWidth = val - CH5_LastRise;
+        else
+          CH5_PulseWidth = 65535 - CH5_LastRise + val + 1;
+        CH5_State = 0;
+        MODIFY_REG(htim->Instance->CCER, TIM_CCER_CC3P, 0);
+      }
+    }
+
+    /* ---- CH6 (TIM3_CH4) ---- */
+    if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_4)
+    {
+      val = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_4);
+      CH6_LastTick = HAL_GetTick();
+
+      if (CH6_State == 0)
+      {
+        CH6_LastRise = val;
+        CH6_State = 1;
+        MODIFY_REG(htim->Instance->CCER, TIM_CCER_CC4P, TIM_CCER_CC4P);
+      }
+      else
+      {
+        if (val >= CH6_LastRise)
+          CH6_PulseWidth = val - CH6_LastRise;
+        else
+          CH6_PulseWidth = 65535 - CH6_LastRise + val + 1;
+        CH6_State = 0;
+        MODIFY_REG(htim->Instance->CCER, TIM_CCER_CC4P, 0);
+      }
+    }
+  }
+}
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */

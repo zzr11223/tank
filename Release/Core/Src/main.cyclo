@@ -1,0 +1,12 @@
+../Core/Src/main.c:299:13:CommitTrackPwm	4
+../Core/Src/main.c:352:13:DisableYawHold	1
+../Core/Src/main.c:790:13:ResetTrackSpeedControl	1
+../Core/Src/main.c:323:13:RefreshInfraredInputs	6
+../Core/Src/main.c:638:13:RcCaptureEdge	6
+../Core/Src/main.c:257:16:AngleToCentiDegrees	2
+../Core/Src/main.c:603:6:HAL_UART_RxCpltCallback	4
+../Core/Src/main.c:630:6:HAL_UART_ErrorCallback	2
+../Core/Src/main.c:1178:6:SystemClock_Config	3
+../Core/Src/main.c:977:5:main	69
+../Core/Src/main.c:1215:6:HAL_GPIO_EXTI_Callback	19
+../Core/Src/main.c:1276:6:Error_Handler	1

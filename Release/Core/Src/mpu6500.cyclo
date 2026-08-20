@@ -1,0 +1,15 @@
+..\Core\Src\mpu6500.c:61:14:FastAtan2	7
+..\Core\Src\mpu6500.c:81:14:FastSqrt	4
+..\Core\Src\mpu6500.c:234:13:ScheduleReinit	1
+..\Core\Src\mpu6500.c:121:26:ReadRegisterRetry	3
+..\Core\Src\mpu6500.c:110:26:WriteRegisterRetry	3
+..\Core\Src\mpu6500.c:241:9:MPU6500_Init	13
+..\Core\Src\mpu6500.c:305:9:MPU6500_ReadData	4
+..\Core\Src\mpu6500.c:327:6:MPU6500_Calibrate	8
+..\Core\Src\mpu6500.c:364:6:MPU6500_SetStationary	2
+..\Core\Src\mpu6500.c:373:9:MPU6500_Update	35
+..\Core\Src\mpu6500.c:485:9:MPU6500_IsReady	1
+..\Core\Src\mpu6500.c:491:9:MPU6500_GetReadFailures	1
+..\Core\Src\mpu6500.c:496:9:MPU6500_GetInitFailure	1
+..\Core\Src\mpu6500.c:501:9:MPU6500_GetLastWhoAmI	1
+..\Core\Src\mpu6500.c:506:10:MPU6500_GetLastI2cError	1
