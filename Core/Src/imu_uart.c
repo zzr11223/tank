@@ -7,7 +7,6 @@
 #define IMU_UART_RX_BUFFER_SIZE       256U
 #define IMU_UART_FRAME_BODY_MAX        64U
 #define IMU_UART_EULER_TIMEOUT_MS     500U
-#define IMU_UART_QUERY_INTERVAL_MS    100U
 #define IMU_UART_RAD_TO_DEG      57.2957795f
 
 #if ((IMU_UART_RX_BUFFER_SIZE & (IMU_UART_RX_BUFFER_SIZE - 1U)) != 0U)
@@ -32,8 +31,6 @@ static uint8_t imu_uart_rx_byte;
 static volatile uint8_t imu_rx_buffer[IMU_UART_RX_BUFFER_SIZE];
 static volatile uint16_t imu_rx_head;
 static volatile uint16_t imu_rx_tail;
-static volatile uint32_t imu_rx_bytes;
-static volatile uint32_t imu_rx_overflows;
 
 static uint8_t parser_state;
 static uint8_t parser_frame_length;
@@ -43,10 +40,6 @@ static uint16_t parser_body_index;
 
 static uint8_t imu_euler_valid;
 static uint32_t imu_last_euler_tick;
-static uint32_t imu_last_query_tick;
-static uint32_t imu_valid_frames;
-static uint32_t imu_euler_frames;
-static uint32_t imu_checksum_errors;
 
 static uint16_t IMU_UART_NextIndex(uint16_t index)
 {
@@ -59,8 +52,11 @@ static void IMU_UART_PushFromIsr(uint8_t byte)
 
   if (next == imu_rx_tail)
   {
-    ++imu_rx_overflows;
-    return;
+    /* Match the public reference driver's policy: keep the newest byte and
+       discard the oldest one when the ring buffer is full.  This is safer
+       for a continuous auto-report stream because a stale partial frame is
+       less useful than the beginning of the next frame. */
+    imu_rx_tail = IMU_UART_NextIndex(imu_rx_tail);
   }
 
   imu_rx_buffer[imu_rx_head] = byte;
@@ -99,20 +95,11 @@ static uint8_t IMU_UART_FloatIsFinite(float value)
   return ((bits & 0x7F800000UL) != 0x7F800000UL) ? 1U : 0U;
 }
 
-static float IMU_UART_NormalizeAngle(float angle)
-{
-  while (angle > 180.0f) angle -= 360.0f;
-  while (angle < -180.0f) angle += 360.0f;
-  return angle;
-}
-
 static void IMU_UART_ParseFrame(uint8_t function,
                                 const uint8_t *payload,
                                 uint16_t payload_length,
                                 uint32_t now_ms)
 {
-  uint8_t parsed = 0U;
-
   switch (function)
   {
     case IMU_UART_FUNC_RAW_ACCEL:
@@ -131,7 +118,6 @@ static void IMU_UART_ParseFrame(uint8_t function,
         imu_data.mag[0] = (float)IMU_UART_ReadInt16LE(&payload[12]) * mag_ratio;
         imu_data.mag[1] = (float)IMU_UART_ReadInt16LE(&payload[14]) * mag_ratio;
         imu_data.mag[2] = (float)IMU_UART_ReadInt16LE(&payload[16]) * mag_ratio;
-        parsed = 1U;
       }
       break;
 
@@ -142,7 +128,6 @@ static void IMU_UART_ParseFrame(uint8_t function,
         imu_data.gyro[0] = (float)IMU_UART_ReadInt16LE(&payload[0]) * gyro_ratio;
         imu_data.gyro[1] = (float)IMU_UART_ReadInt16LE(&payload[2]) * gyro_ratio;
         imu_data.gyro[2] = (float)IMU_UART_ReadInt16LE(&payload[4]) * gyro_ratio;
-        parsed = 1U;
       }
       break;
 
@@ -153,7 +138,6 @@ static void IMU_UART_ParseFrame(uint8_t function,
         imu_data.mag[0] = (float)IMU_UART_ReadInt16LE(&payload[0]) * mag_ratio;
         imu_data.mag[1] = (float)IMU_UART_ReadInt16LE(&payload[2]) * mag_ratio;
         imu_data.mag[2] = (float)IMU_UART_ReadInt16LE(&payload[4]) * mag_ratio;
-        parsed = 1U;
       }
       break;
 
@@ -165,7 +149,6 @@ static void IMU_UART_ParseFrame(uint8_t function,
         {
           imu_data.quaternion[i] = IMU_UART_ReadFloatLE(&payload[i * 4U]);
         }
-        parsed = 1U;
       }
       break;
 
@@ -180,25 +163,17 @@ static void IMU_UART_ParseFrame(uint8_t function,
             IMU_UART_FloatIsFinite(pitch) &&
             IMU_UART_FloatIsFinite(yaw))
         {
-          roll *= IMU_UART_RAD_TO_DEG;
-          pitch *= IMU_UART_RAD_TO_DEG;
-          yaw *= IMU_UART_RAD_TO_DEG;
-
-          if ((roll > -720.0f) && (roll < 720.0f) &&
-              (pitch > -720.0f) && (pitch < 720.0f) &&
-              (yaw > -720.0f) && (yaw < 720.0f))
-          {
-            imu_roll = IMU_UART_NormalizeAngle(roll);
-            imu_pitch = IMU_UART_NormalizeAngle(pitch);
-            imu_yaw = IMU_UART_NormalizeAngle(yaw);
-            imu_data.euler[0] = imu_roll;
-            imu_data.euler[1] = imu_pitch;
-            imu_data.euler[2] = imu_yaw;
-            imu_last_euler_tick = now_ms;
-            imu_euler_valid = 1U;
-            ++imu_euler_frames;
-            parsed = 1U;
-          }
+          /* Reference driver: function 0x26 is three little-endian floats
+             in radians, ordered Roll, Pitch, Yaw.  Do not change the IMU
+             algorithm or apply a software Yaw offset here. */
+          imu_roll = roll * IMU_UART_RAD_TO_DEG;
+          imu_pitch = pitch * IMU_UART_RAD_TO_DEG;
+          imu_yaw = yaw * IMU_UART_RAD_TO_DEG;
+          imu_data.euler[0] = imu_roll;
+          imu_data.euler[1] = imu_pitch;
+          imu_data.euler[2] = imu_yaw;
+          imu_last_euler_tick = now_ms;
+          imu_euler_valid = 1U;
         }
       }
       break;
@@ -211,7 +186,6 @@ static void IMU_UART_ParseFrame(uint8_t function,
         {
           imu_data.barometer[i] = IMU_UART_ReadFloatLE(&payload[i * 4U]);
         }
-        parsed = 1U;
       }
       break;
 
@@ -221,7 +195,6 @@ static void IMU_UART_ParseFrame(uint8_t function,
         imu_data.version[0] = payload[0];
         imu_data.version[1] = payload[1];
         imu_data.version[2] = payload[2];
-        parsed = 1U;
       }
       break;
 
@@ -229,10 +202,6 @@ static void IMU_UART_ParseFrame(uint8_t function,
       break;
   }
 
-  if (parsed)
-  {
-    ++imu_valid_frames;
-  }
 }
 
 HAL_StatusTypeDef IMU_UART_Init(void)
@@ -243,20 +212,24 @@ HAL_StatusTypeDef IMU_UART_Init(void)
   imu_roll = 0.0f;
   imu_rx_head = 0U;
   imu_rx_tail = 0U;
-  imu_rx_bytes = 0U;
-  imu_rx_overflows = 0U;
   parser_state = IMU_RX_WAIT_HEAD1;
   parser_frame_length = 0U;
   parser_function = 0U;
   parser_body_index = 0U;
   imu_euler_valid = 0U;
   imu_last_euler_tick = 0U;
-  imu_last_query_tick = 0U;
-  imu_valid_frames = 0U;
-  imu_euler_frames = 0U;
-  imu_checksum_errors = 0U;
 
   return HAL_UART_Receive_IT(&huart2, &imu_uart_rx_byte, 1U);
+}
+
+HAL_StatusTypeDef IMU_UART_RequestVersion(void)
+{
+  const uint8_t request[2] = {IMU_UART_FUNC_VERSION, 0x00U};
+
+  /* Same startup request as the supplied STM32F103C8T6 reference. */
+  return IMU_UART_SendCommand(IMU_UART_FUNC_REQUEST,
+                              request,
+                              (uint8_t)sizeof(request));
 }
 
 void IMU_UART_HandleRxComplete(UART_HandleTypeDef *huart)
@@ -266,7 +239,6 @@ void IMU_UART_HandleRxComplete(UART_HandleTypeDef *huart)
     return;
   }
 
-  ++imu_rx_bytes;
   IMU_UART_PushFromIsr(imu_uart_rx_byte);
   (void)HAL_UART_Receive_IT(&huart2, &imu_uart_rx_byte, 1U);
 }
@@ -353,10 +325,6 @@ void IMU_UART_Process(uint32_t now_ms)
                                 body_length - 1U,
                                 now_ms);
           }
-          else
-          {
-            ++imu_checksum_errors;
-          }
           parser_state = IMU_RX_WAIT_HEAD1;
         }
         break;
@@ -368,19 +336,6 @@ void IMU_UART_Process(uint32_t now_ms)
     }
   }
 
-  /* The reference sensor may be configured for either automatic reporting or
-     request/response mode. Query Euler data only while reports are missing or
-     stale; automatic-report mode therefore receives no unnecessary traffic. */
-  if (((!imu_euler_valid) ||
-       ((now_ms - imu_last_euler_tick) > IMU_UART_EULER_TIMEOUT_MS)) &&
-      ((now_ms - imu_last_query_tick) >= IMU_UART_QUERY_INTERVAL_MS))
-  {
-    const uint8_t request[2] = {IMU_UART_FUNC_EULER, 0x00U};
-    imu_last_query_tick = now_ms;
-    (void)IMU_UART_SendCommand(IMU_UART_FUNC_REQUEST,
-                               request,
-                               (uint8_t)sizeof(request));
-  }
 }
 
 uint8_t IMU_UART_IsReady(void)
@@ -392,31 +347,6 @@ uint8_t IMU_UART_IsReady(void)
 uint32_t IMU_UART_GetLastEulerTick(void)
 {
   return imu_last_euler_tick;
-}
-
-uint32_t IMU_UART_GetRxByteCount(void)
-{
-  return imu_rx_bytes;
-}
-
-uint32_t IMU_UART_GetValidFrameCount(void)
-{
-  return imu_valid_frames;
-}
-
-uint32_t IMU_UART_GetEulerFrameCount(void)
-{
-  return imu_euler_frames;
-}
-
-uint32_t IMU_UART_GetChecksumErrorCount(void)
-{
-  return imu_checksum_errors;
-}
-
-uint32_t IMU_UART_GetOverflowCount(void)
-{
-  return imu_rx_overflows;
 }
 
 void IMU_UART_GetAll(IMU_UART_Data_t *out)

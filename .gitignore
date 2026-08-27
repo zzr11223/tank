@@ -1,0 +1,24 @@
+# Keil 编译生成物
+**/Objects/
+**/Listings/
+**/Release/
+**/build/
+**/*.axf
+**/*.hex
+**/*.map
+**/*.lnp
+**/*.crf
+**/*.d
+**/*.o
+**/*.su
+**/*.cyclo
+**/*.dep
+**/*.htm
+
+# Keil 个人配置
+**/*.uvoptx
+**/*.uvguix
+**/*.uvguix.*
+
+# 本地工具临时目录
+.workbuddy/

@@ -18,6 +18,7 @@ extern "C" {
 #define IMU_UART_FUNC_EULER        0x26U
 #define IMU_UART_FUNC_BAROMETER    0x32U
 #define IMU_UART_FUNC_REQUEST      0x80U
+#define IMU_UART_FUNC_RETURN_STATE 0x81U
 
 typedef struct
 {
@@ -36,17 +37,13 @@ extern float imu_pitch;
 extern float imu_roll;
 
 HAL_StatusTypeDef IMU_UART_Init(void);
+HAL_StatusTypeDef IMU_UART_RequestVersion(void);
 void IMU_UART_Process(uint32_t now_ms);
 void IMU_UART_HandleRxComplete(UART_HandleTypeDef *huart);
 void IMU_UART_HandleError(UART_HandleTypeDef *huart);
 
 uint8_t IMU_UART_IsReady(void);
 uint32_t IMU_UART_GetLastEulerTick(void);
-uint32_t IMU_UART_GetRxByteCount(void);
-uint32_t IMU_UART_GetValidFrameCount(void);
-uint32_t IMU_UART_GetEulerFrameCount(void);
-uint32_t IMU_UART_GetChecksumErrorCount(void);
-uint32_t IMU_UART_GetOverflowCount(void);
 void IMU_UART_GetAll(IMU_UART_Data_t *out);
 
 HAL_StatusTypeDef IMU_UART_SendCommand(uint8_t function,

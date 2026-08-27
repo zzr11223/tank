@@ -41,17 +41,28 @@
 /* USER CODE BEGIN PV */
 
 /* ----- 原有 6 通道 PWM 输入：引脚不变，改为 GPIO EXTI + TIM5 计时 ----- */
+#define RC_INPUT_MEDIAN_SAMPLES      7U  /* 必须为奇数 */
+
+typedef struct
+{
+  uint32_t samples[RC_INPUT_MEDIAN_SAMPLES];
+  uint8_t next_index;
+  uint8_t initialized;
+} RcMedianFilter;
+
 /* CH1: PA6 */
 volatile uint32_t CH1_PulseWidth = 0;
 volatile uint32_t CH1_LastRise   = 0;
 volatile uint8_t  CH1_State      = 0;
 volatile uint32_t CH1_LastTick   = 0;
+static RcMedianFilter CH1_InputFilter = {0};
 
 /* CH2: PA2 */
 volatile uint32_t CH2_PulseWidth = 0;
 volatile uint32_t CH2_LastRise   = 0;
 volatile uint8_t  CH2_State      = 0;
 volatile uint32_t CH2_LastTick   = 0;
+static RcMedianFilter CH2_InputFilter = {0};
 
 /* CH3: PA3 */
 volatile uint32_t CH3_PulseWidth = 0;
@@ -59,24 +70,28 @@ volatile uint32_t CH3_LastRise   = 0;
 volatile uint8_t  CH3_State      = 0;
 volatile uint32_t CH3_LastTick   = 0;
 volatile uint32_t CH3_RawPulseWidth = 0;
+static RcMedianFilter CH3_InputFilter = {0};
 
 /* CH4: PA7 */
 volatile uint32_t CH4_PulseWidth = 0;
 volatile uint32_t CH4_LastRise   = 0;
 volatile uint8_t  CH4_State      = 0;
 volatile uint32_t CH4_LastTick   = 0;
+static RcMedianFilter CH4_InputFilter = {0};
 
 /* CH5: PB0 */
 volatile uint32_t CH5_PulseWidth = 0;
 volatile uint32_t CH5_LastRise   = 0;
 volatile uint8_t  CH5_State      = 0;
 volatile uint32_t CH5_LastTick   = 0;
+static RcMedianFilter CH5_InputFilter = {0};
 
 /* CH6: PB1 */
 volatile uint32_t CH6_PulseWidth = 0;
 volatile uint32_t CH6_LastRise   = 0;
 volatile uint8_t  CH6_State      = 0;
 volatile uint32_t CH6_LastTick   = 0;
+static RcMedianFilter CH6_InputFilter = {0};
 
 /* 四路数字红外：OUT 低电平=达到设定距离阈值，任一路触发即紧急停车。 */
 volatile uint8_t IR1_Detected = 0U;
@@ -84,6 +99,7 @@ volatile uint8_t IR2_Detected = 0U;
 volatile uint8_t IR3_Detected = 0U;
 volatile uint8_t IR4_Detected = 0U;
 volatile uint8_t EmergencyStopActive = 0U;
+volatile uint8_t EmergencyStopLatched = 0U;
 static volatile uint8_t TrackPwmReady = 0U;
 
 /* 四路 AB 编码器累计计数，正负方向由定时器硬件决定。 */
@@ -117,7 +133,7 @@ static int32_t RightTrackControlSpeedCps = 0;
 
 char dbg_buf[448];
 uint32_t LastDebugTick = 0;
-char attitude_buf[112];
+char attitude_buf[128];
 uint32_t LastAttitudeUartTick = 0;
 
 /*
@@ -136,15 +152,9 @@ uint32_t LastAttitudeUartTick = 0;
 #define RC_INPUT_VALID_MIN_US     1000
 #define RC_INPUT_VALID_MAX_US     2100
 #define RC_DEADBAND_US              40
-/* 输入一阶低通（IIR）：每帧只向新测量值移动 1/N，单帧毛刺或短暂
- * 掉帧对滤波值影响较小；持续的真实摇杆变化约 N 帧后跟到位。
- * 本机接收机实际输出不会低于 1000 us，低于 1000 的读数一律丢弃。
- * N=1 时滤波完全取消（原始值直通，最跟手）；N 越大越平滑。 */
-#define RC_INPUT_FILTER_DIV          8
-/* 失联保护策略：设为 0 表示信号丢失时保持最后有效值（不主动停车，
- * 测试用；注意失控风险）；设为 N(ms) 表示连续 N ms 无有效帧才清零停车。 */
-#define RC_INPUT_FAILSAFE_MS         0
-
+/* 遥控器输入使用 7 点中值滤波：剔除最多连续三帧尖峰，真实阶跃
+ * 连续四帧后通过；没有 IIR 拖尾。
+ * 本机接收机实际输出不会低于 1000 us，低于 1000 的读数一律丢弃。 */
 /* 串口自动测试：T/R/L=1500~2000；R=/L= 可独立测试左右履带。 */
 #define SERIAL_TEST_TIMEOUT_MS      500
 #define SERIAL_TEST_MIN_US          1500
@@ -152,7 +162,6 @@ uint32_t LastAttitudeUartTick = 0;
 #define SERIAL_RX_BUFFER_SIZE         64
 #define DEBUG_TELEMETRY_INTERVAL_MS  100
 #define ATTITUDE_UART_INTERVAL_MS      20
-#define ATTITUDE_UART_DIAGNOSTIC_INTERVAL_MS 500
 
 /* 编码器速度：20 ms 采样；遥测使用较强滤波，闭环使用较快滤波。 */
 #define TRACK_SPEED_SAMPLE_INTERVAL_MS  20
@@ -166,17 +175,19 @@ uint32_t LastAttitudeUartTick = 0;
  */
 #define TRACK_SPEED_CONTROL_MIN_THROTTLE_US       60
 #define TRACK_SPEED_CONTROL_MIN_AVERAGE_CPS      300
-#define TRACK_SPEED_CONTROL_DEADBAND_CPS          80
-#define TRACK_SPEED_CONTROL_KP_US_PER_CPS     0.012f
-#define TRACK_SPEED_CONTROL_KI_US_PER_SAMPLE  0.0008f
+#define TRACK_SPEED_CONTROL_DEADBAND_CPS          50
+#define TRACK_SPEED_CONTROL_KP_US_PER_CPS     0.020f
+#define TRACK_SPEED_CONTROL_KI_US_PER_SAMPLE  0.0015f
 #define TRACK_SPEED_CONTROL_INTEGRAL_LIMIT_CPS 25000.0f
-#define TRACK_SPEED_CONTROL_MAX_CORRECTION_US     30
-#define TRACK_SPEED_CONTROL_YAW_FREEZE_DEG       2.0f
+#define TRACK_SPEED_CONTROL_MAX_CORRECTION_US     60
 static uint8_t TrackSpeedControlActive = 0U;
 static float TrackSpeedControlIntegral = 0.0f;
 static int32_t TrackSpeedCorrectionUs = 0;
 static uint32_t TrackSpeedControlLastSampleTick = 0U;
 
+#define YAW_HOLD_CONTROL_ENABLED          0
+
+#if YAW_HOLD_CONTROL_ENABLED
 /*
  * 航向保持：摇杆为直行时锁定进入直行瞬间的 yaw。每 40 ms 根据目标与
  * 当前 yaw 的误差，给两侧电调叠加等量反向 PWM，实现差速回正。
@@ -184,12 +195,15 @@ static uint32_t TrackSpeedControlLastSampleTick = 0U;
  */
 #define YAW_HOLD_UPDATE_INTERVAL_MS       40U
 #define YAW_HOLD_MIN_THROTTLE_US           0
-#define YAW_HOLD_DEADBAND_DEG           0.5f
+#define YAW_HOLD_DEADBAND_DEG           0.0f
 #define YAW_HOLD_KP_US_PER_DEG          2.5f
 #define YAW_HOLD_KI_US_PER_SAMPLE       0.05f
 #define YAW_HOLD_INTEGRAL_LIMIT        400.0f
 #define YAW_HOLD_MAX_CORRECTION_US      100
-#define YAW_HOLD_CORRECTION_SIGN          (-1)
+/* 修正方向：右偏(yaw 减小, error>0)需右履带加快拉回左；
+   right += yc; left -= yc 下需 yc>0，故 SIGN=+1。
+   实测原值 -1 会让右偏时左履带加快、加剧右偏，故翻转。 */
+#define YAW_HOLD_CORRECTION_SIGN          (1)
 #define YAW_HOLD_EXIT_CONFIRM_MS        150U
 
 static uint8_t YawHoldActive = 0;
@@ -199,6 +213,7 @@ static float YawHoldIntegral = 0.0f;
 static int32_t YawHoldCorrectionUs = 0;
 static uint32_t YawHoldLastUpdateTick = 0;
 static uint32_t YawHoldExitSinceTick = 0;
+#endif
 
 /*
  * Two 3.87 m loaded runs were used to normalize each encoder to the same
@@ -263,6 +278,17 @@ static int32_t AngleToCentiDegrees(float angle)
   return -(int32_t)((-angle) * 100.0f + 0.5f);
 }
 
+/* 串口显示用的 Yaw 范围：0.00 <= Yaw < 360.00 度。 */
+static int32_t AngleToUnsignedCentiDegrees(float angle)
+{
+  int32_t centi_degrees;
+
+  while (angle < 0.0f) angle += 360.0f;
+  while (angle >= 360.0f) angle -= 360.0f;
+  centi_degrees = (int32_t)(angle * 100.0f + 0.5f);
+  return (centi_degrees >= 36000) ? 0 : centi_degrees;
+}
+
 /* Convert an RC pulse to a signed command around 0. Invalid/lost input stops. */
 static int32_t RcPulseToCommand(uint32_t pulse_us)
 {
@@ -294,14 +320,14 @@ static uint16_t CommandToRcPulse(int32_t command)
 
 /*
  * 所有运行时履带 PWM 都经此函数提交。短临界区保证红外中断与主循环
- * 不会交叉写两路 CCR；急停有效时，无论调用者请求什么都强制输出中位。
+ * 不会交叉写两路 CCR；任一安全锁有效时，无论调用者请求什么都强制回中。
  */
 static void CommitTrackPwm(uint16_t left_pwm, uint16_t right_pwm)
 {
   uint32_t primask = __get_PRIMASK();
 
   __disable_irq();
-  if (EmergencyStopActive)
+  if (EmergencyStopActive || EmergencyStopLatched)
   {
     left_pwm = RC_OUTPUT_CENTER_US;
     right_pwm = RC_OUTPUT_CENTER_US;
@@ -331,16 +357,21 @@ static void RefreshInfraredInputs(void)
   IR4_Detected = (HAL_GPIO_ReadPin(IR4_GPIO_Port, IR4_Pin) == GPIO_PIN_RESET);
   EmergencyStopActive = (IR1_Detected != 0U) || (IR2_Detected != 0U) ||
                         (IR3_Detected != 0U) || (IR4_Detected != 0U);
+  if (EmergencyStopActive)
+  {
+    EmergencyStopLatched = 1U;
+  }
   if (primask == 0U)
   {
     __enable_irq();
   }
-  if (EmergencyStopActive)
+  if (EmergencyStopActive || EmergencyStopLatched)
   {
     CommitTrackPwm(RC_OUTPUT_CENTER_US, RC_OUTPUT_CENTER_US);
   }
 }
 
+#if YAW_HOLD_CONTROL_ENABLED
 /* 将目标和当前 yaw 的差值归一化到 [-180, 180] 度，避免跨 ±180 度时误差跳变。 */
 static float NormalizeYawError(float error)
 {
@@ -474,6 +505,7 @@ static int32_t UpdateYawHold(int32_t throttle, int32_t steering, uint32_t now)
   }
   return YawHoldCorrectionUs;
 }
+#endif
 
 static void SerialTestReply(const char *text)
 {
@@ -635,16 +667,70 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   }
 }
 
+static uint32_t MedianU32(const uint32_t samples[RC_INPUT_MEDIAN_SAMPLES])
+{
+  uint32_t sorted[RC_INPUT_MEDIAN_SAMPLES];
+  uint32_t value;
+  uint8_t i;
+  uint8_t j;
+
+  for (i = 0U; i < RC_INPUT_MEDIAN_SAMPLES; i++)
+  {
+    sorted[i] = samples[i];
+  }
+
+  for (i = 1U; i < RC_INPUT_MEDIAN_SAMPLES; i++)
+  {
+    value = sorted[i];
+    j = i;
+    while ((j > 0U) && (sorted[j - 1U] > value))
+    {
+      sorted[j] = sorted[j - 1U];
+      j--;
+    }
+    sorted[j] = value;
+  }
+
+  return sorted[RC_INPUT_MEDIAN_SAMPLES / 2U];
+}
+
+static uint32_t FilterRcPulseMedian(RcMedianFilter *filter,
+                                    uint32_t sample,
+                                    uint8_t reset)
+{
+  uint8_t i;
+
+  if ((filter->initialized == 0U) || (reset != 0U))
+  {
+    for (i = 0U; i < RC_INPUT_MEDIAN_SAMPLES; i++)
+    {
+      filter->samples[i] = sample;
+    }
+    filter->next_index = 0U;
+    filter->initialized = 1U;
+    return sample;
+  }
+
+  filter->samples[filter->next_index] = sample;
+  filter->next_index++;
+  if (filter->next_index >= RC_INPUT_MEDIAN_SAMPLES)
+  {
+    filter->next_index = 0U;
+  }
+
+  return MedianU32(filter->samples);
+}
+
 static void RcCaptureEdge(volatile uint32_t *pulse_width,
-                          volatile uint32_t *last_rise,
-                          volatile uint8_t *state,
-                          volatile uint32_t *last_tick,
+                           RcMedianFilter *input_filter,
+                           volatile uint32_t *last_rise,
+                           volatile uint8_t *state,
+                           volatile uint32_t *last_tick,
                           GPIO_TypeDef *port,
                           uint16_t pin)
 {
   uint32_t now = __HAL_TIM_GET_COUNTER(&htim5);
   uint32_t width;
-  int32_t delta;
 
   if (HAL_GPIO_ReadPin(port, pin) == GPIO_PIN_SET)
   {
@@ -662,19 +748,11 @@ static void RcCaptureEdge(volatile uint32_t *pulse_width,
        * 真实丢帧生效。 */
       *last_tick = HAL_GetTick();
 
-      if (*pulse_width == 0U)
-      {
-        /* 上电首帧或失败保护恢复后：立即采纳，避免卡在 0。 */
-        *pulse_width = width;
-      }
-      else
-      {
-        /* 一阶低通：短暂变化每帧只移动 1/N，对整体影响很小；
-         * 持续的真实摇杆变化约 N 帧后跟到位。 */
-        delta = (int32_t)width - (int32_t)*pulse_width;
-        *pulse_width =
-            (uint32_t)((int32_t)*pulse_width + delta / RC_INPUT_FILTER_DIV);
-      }
+      /* 上电首帧或失败保护恢复后立即采纳；其余帧使用 7 点中值，
+       * 最多连续三个异常脉宽不会进入控制量。 */
+      *pulse_width = FilterRcPulseMedian(input_filter,
+                                         width,
+                                         (*pulse_width == 0U) ? 1U : 0U);
     }
     /* 低于 1000 us（本机实际不可能出现）或超过 2100 us 的读数直接丢弃。 */
     *state = 0;
@@ -795,18 +873,45 @@ static void ResetTrackSpeedControl(void)
   TrackSpeedControlLastSampleTick = SpeedLastTick;
 }
 
+static uint8_t RcPulseIsValid(uint32_t pulse_us)
+{
+  return ((pulse_us >= RC_INPUT_VALID_MIN_US) &&
+          (pulse_us <= RC_INPUT_VALID_MAX_US)) ? 1U : 0U;
+}
+
+static uint8_t RcControlsAreCentered(void)
+{
+  return ((RcPulseIsValid(CH1_PulseWidth) != 0U) &&
+          (RcPulseIsValid(CH3_PulseWidth) != 0U) &&
+          (RcPulseToCommand(CH1_PulseWidth) == 0) &&
+          (RcPulseToCommand(CH3_PulseWidth) == 0)) ? 1U : 0U;
+}
+
+static void UpdateInfraredInterlock(void)
+{
+  if (EmergencyStopActive != 0U)
+  {
+    EmergencyStopLatched = 1U;
+  }
+  else if ((EmergencyStopLatched != 0U) &&
+           (RcControlsAreCentered() != 0U))
+  {
+    /* 障碍解除后必须先把油门和转向都回中一次；锁存立即解除，
+     * 随后的下一次推杆才形成新的控制命令。 */
+    EmergencyStopLatched = 0U;
+  }
+}
+
 /*
  * 直行时闭合左右速度差 PI 环。
  * error > 0 表示左履带更快，因此输出正修正：右侧加速、左侧减速。
- * yaw 已偏离目标较多时暂停速度 PI 更新，避免速度环抵消航向环主动制造的
- * 左右速度差；原有静态速度补偿继续保留，航向回正后再恢复速度积分。
+ * 本阶段只根据编码器速度工作，不读取 IMU 状态或航向角。
  */
 static int32_t UpdateTrackSpeedControl(int32_t throttle, int32_t steering)
 {
   int32_t throttle_magnitude;
   int32_t average_speed;
   int32_t speed_error;
-  float yaw_error;
   float candidate_integral;
   float raw_correction;
 
@@ -840,16 +945,6 @@ static int32_t UpdateTrackSpeedControl(int32_t throttle, int32_t steering)
     TrackSpeedControlIntegral = 0.0f;
     TrackSpeedCorrectionUs = 0;
     return 0;
-  }
-
-  if (YawHoldActive && IMU_UART_IsReady())
-  {
-    yaw_error = NormalizeYawError(YawHoldTargetYaw - imu_yaw);
-    if ((yaw_error > TRACK_SPEED_CONTROL_YAW_FREEZE_DEG) ||
-        (yaw_error < -TRACK_SPEED_CONTROL_YAW_FREEZE_DEG))
-    {
-      return TrackSpeedCorrectionUs;
-    }
   }
 
   speed_error = LeftTrackControlSpeedCps - RightTrackControlSpeedCps;
@@ -904,14 +999,12 @@ static int32_t UpdateTrackSpeedControl(int32_t throttle, int32_t steering)
  * Tank control. With steering priority enabled, any right-stick horizontal
  * command drives the tracks in opposite directions, so it turns in place.
  */
-static void UpdateTankDrive(uint32_t throttle_pulse_us, uint32_t steering_pulse_us,
-                            uint32_t now)
+static void UpdateTankDrive(uint32_t throttle_pulse_us, uint32_t steering_pulse_us)
 {
   int32_t throttle = RcPulseToCommand(throttle_pulse_us);
   int32_t steering = RcPulseToCommand(steering_pulse_us);
   int32_t right_command;
   int32_t left_command;
-  int32_t yaw_correction;
   int32_t speed_correction;
   int32_t drive_direction;
   uint16_t right_pwm;
@@ -945,15 +1038,10 @@ static void UpdateTankDrive(uint32_t throttle_pulse_us, uint32_t steering_pulse_
    * 速度同步修正的是履带速度幅值：前进时正修正增加右 PWM，倒车时正修正
    * 减小右 PWM（让右侧反向幅值更大）。左右等量反向叠加，不改变平均油门。
    */
-  yaw_correction = UpdateYawHold(throttle, steering, now);
   speed_correction = UpdateTrackSpeedControl(throttle, steering);
   drive_direction = (throttle >= 0) ? 1 : -1;
   right_command += drive_direction * speed_correction;
   left_command  -= drive_direction * speed_correction;
-
-  /* 航向闭环必须在左右履带的接线反相前叠加，保证符号始终对应物理履带。 */
-  right_command += yaw_correction;
-  left_command  -= yaw_correction;
 
 #if TANK_RIGHT_TRACK_REVERSED
   right_command = -right_command;
@@ -1010,8 +1098,9 @@ int main(void)
   MX_TIM8_Init();
   /* USER CODE BEGIN 2 */
 
-  /* USART2 nine-axis IMU is optional: a missing sensor must not stop vehicle control. */
+  /* USART2 (remapped to PD5/PD6) nine-axis IMU is optional: a missing sensor must not stop vehicle control. */
   (void)IMU_UART_Init();
+  (void)IMU_UART_RequestVersion();
 
   /* 启动 TIM1 CH1/CH2 PWM 输出 */
   /* Start both ESC/motor-controller outputs at their neutral pulse width. */
@@ -1081,31 +1170,18 @@ int main(void)
     UpdateEncoderCounters();
     UpdateTrackSpeedTelemetry(now);
 
-    /* 失联保护：RC_INPUT_FAILSAFE_MS=0 时信号丢失保持最后有效值，
-     * 不主动停车；>0 时连续超时无有效帧才清零停车。 */
-#if RC_INPUT_FAILSAFE_MS > 0
-    if (now - CH1_LastTick > RC_INPUT_FAILSAFE_MS) CH1_PulseWidth = 0;
-    if (now - CH2_LastTick > RC_INPUT_FAILSAFE_MS) CH2_PulseWidth = 0;
-    if (now - CH3_LastTick > RC_INPUT_FAILSAFE_MS)
-    {
-      CH3_PulseWidth = 0;
-    }
-    if (now - CH4_LastTick > RC_INPUT_FAILSAFE_MS) CH4_PulseWidth = 0;
-    if (now - CH5_LastTick > RC_INPUT_FAILSAFE_MS) CH5_PulseWidth = 0;
-    if (now - CH6_LastTick > RC_INPUT_FAILSAFE_MS) CH6_PulseWidth = 0;
-#endif
+    /* 只保留红外急停锁存：障碍解除后先回中一次，再接受新的推杆命令。 */
+    UpdateInfraredInterlock();
 
-    /* 红外急停优先级最高；障碍未清除时禁止 RC、串口测试和闭环覆盖中位。 */
-    if (EmergencyStopActive)
+    /* 红外锁存优先级最高；解除前禁止 RC、串口测试和闭环覆盖中位。 */
+    if (EmergencyStopActive || EmergencyStopLatched)
     {
-      DisableYawHold(now);
       ResetTrackSpeedControl();
       CommitTrackPwm(RC_OUTPUT_CENTER_US, RC_OUTPUT_CENTER_US);
     }
     else if (SerialTestMode && SerialTestIndependentMode)
     {
-      /* 独立扫档时不允许航向环或速度环保留和介入。 */
-      DisableYawHold(now);
+      /* 独立扫档时不允许速度环保留和介入。 */
       ResetTrackSpeedControl();
       ApplyIndependentTrackPwm();
     }
@@ -1115,55 +1191,46 @@ int main(void)
       steering_pulse = SerialTestMode ? RC_OUTPUT_CENTER_US : CH1_PulseWidth;
 
       /* CH3 controls forward/reverse; CH1 remains the steering input. */
-       UpdateTankDrive(throttle_pulse, steering_pulse, now);
+       UpdateTankDrive(throttle_pulse, steering_pulse);
     }
 
-    /* 临时双串口诊断：USART1/PA9 固定以 -1111 开头，后面依次是
-       USART2 收到的字节数、欧拉角帧数、校验错误数。四列均为纯数字，
-       可直接被 VOFA+ FireWater 解析。 */
+    /* USART1/PA9 telemetry CSV (115200 8N1):
+       CH1,CH2,CH3,CH4,CH5,CH6,LPWM,RPWM.
+       CH1..CH6 are the filtered receiver pulse widths in us. LPWM/RPWM are
+       the actual PWM pulse widths in us committed to the left/right ESC. */
     if ((now - LastDebugTick) >= DEBUG_TELEMETRY_INTERVAL_MS)
     {
       int n = sprintf(dbg_buf,
-                      "-1111,%lu,%lu,%lu\r\n",
-                      (unsigned long)IMU_UART_GetRxByteCount(),
-                      (unsigned long)IMU_UART_GetEulerFrameCount(),
-                      (unsigned long)IMU_UART_GetChecksumErrorCount());
+                      "%lu,%lu,%lu,%lu,%lu,%lu,%u,%u\r\n",
+                      (unsigned long)CH1_PulseWidth,
+                      (unsigned long)CH2_PulseWidth,
+                      (unsigned long)CH3_PulseWidth,
+                      (unsigned long)CH4_PulseWidth,
+                      (unsigned long)CH5_PulseWidth,
+                      (unsigned long)CH6_PulseWidth,
+                      (unsigned int)LeftTrackPwmUs,
+                      (unsigned int)RightTrackPwmUs);
       HAL_UART_Transmit(&huart1, (uint8_t *)dbg_buf, n, 20);
       LastDebugTick = now;
     }
 
-    /* USART3/PB10：第四列固定为 3，便于与 USART1/PA9 区分。
-       正常时输出 Yaw,Pitch,Roll,3；未收到有效欧拉角时输出
-       -3333,RX字节数,EULER帧数,校验错误数。 */
-    if (IMU_UART_IsReady())
+    /* USART3/PB10：固定周期只输出三轴姿态角 Yaw,Pitch,Roll。
+       首帧到达前会输出 3 个 0，避免串口静默而无法区分“没发送”和“没回帧”。 */
+    if ((now - LastAttitudeUartTick) >= ATTITUDE_UART_INTERVAL_MS)
     {
-      if ((now - LastAttitudeUartTick) >= ATTITUDE_UART_INTERVAL_MS)
-      {
-        int32_t yaw_cd = AngleToCentiDegrees(imu_yaw);
-        int32_t pitch_cd = AngleToCentiDegrees(imu_pitch);
-        int32_t roll_cd = AngleToCentiDegrees(imu_roll);
-        int n = sprintf(attitude_buf,
-                        "%c%ld.%02ld,%c%ld.%02ld,%c%ld.%02ld,3\r\n",
-                        (yaw_cd < 0) ? '-' : '+',
-                        (long)(AbsI32(yaw_cd) / 100),
-                        (long)(AbsI32(yaw_cd) % 100),
-                        (pitch_cd < 0) ? '-' : '+',
-                        (long)(AbsI32(pitch_cd) / 100),
-                        (long)(AbsI32(pitch_cd) % 100),
-                        (roll_cd < 0) ? '-' : '+',
-                        (long)(AbsI32(roll_cd) / 100),
-                        (long)(AbsI32(roll_cd) % 100));
-        HAL_UART_Transmit(&huart3, (uint8_t *)attitude_buf, n, 10);
-        LastAttitudeUartTick = now;
-      }
-    }
-    else if ((now - LastAttitudeUartTick) >= ATTITUDE_UART_DIAGNOSTIC_INTERVAL_MS)
-    {
+      int32_t yaw_cd = AngleToUnsignedCentiDegrees(imu_yaw);
+      int32_t pitch_cd = AngleToCentiDegrees(imu_pitch);
+      int32_t roll_cd = AngleToCentiDegrees(imu_roll);
       int n = sprintf(attitude_buf,
-                      "-3333,%lu,%lu,%lu\r\n",
-                      (unsigned long)IMU_UART_GetRxByteCount(),
-                      (unsigned long)IMU_UART_GetEulerFrameCount(),
-                      (unsigned long)IMU_UART_GetChecksumErrorCount());
+                      "%ld.%02ld,%c%ld.%02ld,%c%ld.%02ld\r\n",
+                      (long)(yaw_cd / 100),
+                      (long)(yaw_cd % 100),
+                      (pitch_cd < 0) ? '-' : '+',
+                      (long)(AbsI32(pitch_cd) / 100),
+                      (long)(AbsI32(pitch_cd) % 100),
+                      (roll_cd < 0) ? '-' : '+',
+                      (long)(AbsI32(roll_cd) / 100),
+                      (long)(AbsI32(roll_cd) % 100));
       HAL_UART_Transmit(&huart3, (uint8_t *)attitude_buf, n, 10);
       LastAttitudeUartTick = now;
     }
@@ -1218,19 +1285,23 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   switch (GPIO_Pin)
   {
     case GPIO_PIN_0:
-      RcCaptureEdge(&CH5_PulseWidth, &CH5_LastRise, &CH5_State, &CH5_LastTick,
+      RcCaptureEdge(&CH5_PulseWidth, &CH5_InputFilter,
+                    &CH5_LastRise, &CH5_State, &CH5_LastTick,
                     GPIOB, GPIO_PIN_0);
       break;
     case GPIO_PIN_1:
-      RcCaptureEdge(&CH6_PulseWidth, &CH6_LastRise, &CH6_State, &CH6_LastTick,
+      RcCaptureEdge(&CH6_PulseWidth, &CH6_InputFilter,
+                    &CH6_LastRise, &CH6_State, &CH6_LastTick,
                     GPIOB, GPIO_PIN_1);
       break;
     case GPIO_PIN_2:
-      RcCaptureEdge(&CH2_PulseWidth, &CH2_LastRise, &CH2_State, &CH2_LastTick,
+      RcCaptureEdge(&CH2_PulseWidth, &CH2_InputFilter,
+                    &CH2_LastRise, &CH2_State, &CH2_LastTick,
                     GPIOA, GPIO_PIN_2);
       break;
     case GPIO_PIN_3:
-      RcCaptureEdge(&CH3_PulseWidth, &CH3_LastRise, &CH3_State, &CH3_LastTick,
+      RcCaptureEdge(&CH3_PulseWidth, &CH3_InputFilter,
+                    &CH3_LastRise, &CH3_State, &CH3_LastTick,
                     GPIOA, GPIO_PIN_3);
       CH3_RawPulseWidth = CH3_PulseWidth;
       break;
@@ -1241,11 +1312,13 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
       IR2_Detected = (HAL_GPIO_ReadPin(IR2_GPIO_Port, IR2_Pin) == GPIO_PIN_RESET);
       break;
     case GPIO_PIN_6:
-      RcCaptureEdge(&CH1_PulseWidth, &CH1_LastRise, &CH1_State, &CH1_LastTick,
+      RcCaptureEdge(&CH1_PulseWidth, &CH1_InputFilter,
+                    &CH1_LastRise, &CH1_State, &CH1_LastTick,
                     GPIOA, GPIO_PIN_6);
       break;
     case GPIO_PIN_7:
-      RcCaptureEdge(&CH4_PulseWidth, &CH4_LastRise, &CH4_State, &CH4_LastTick,
+      RcCaptureEdge(&CH4_PulseWidth, &CH4_InputFilter,
+                    &CH4_LastRise, &CH4_State, &CH4_LastTick,
                     GPIOA, GPIO_PIN_7);
       break;
     case GPIO_PIN_8:
@@ -1262,7 +1335,8 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
                         (IR3_Detected != 0U) || (IR4_Detected != 0U);
   if (EmergencyStopActive)
   {
-    /* 中断内直接回中；CommitTrackPwm 同时防止主循环在竞态窗口覆盖急停。 */
+    EmergencyStopLatched = 1U;
+    /* 中断内立即锁存并回中；CommitTrackPwm 防止主循环在竞态窗口覆盖急停。 */
     CommitTrackPwm(RC_OUTPUT_CENTER_US, RC_OUTPUT_CENTER_US);
   }
 }

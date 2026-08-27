@@ -1,0 +1,50 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 22,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "debug",
+      "displayName": "STM32F103ZET6 Debug",
+      "description": "Debug build using the STM32Cube GNU Arm toolchain.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/debug",
+      "toolchainFile": "${sourceDir}/cmake/arm-none-eabi.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      },
+      "environment": {
+        "PATH": "C:/Users/zzr/AppData/Local/stm32cube/bundles/gnu-tools-for-stm32/14.3.1+st.2/bin;C:/Users/zzr/AppData/Local/stm32cube/bundles/ninja/1.13.2+st.1/bin;$penv{PATH}"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "STM32F103ZET6 Release",
+      "description": "Release build using the STM32Cube GNU Arm toolchain.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/release",
+      "toolchainFile": "${sourceDir}/cmake/arm-none-eabi.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "environment": {
+        "PATH": "C:/Users/zzr/AppData/Local/stm32cube/bundles/gnu-tools-for-stm32/14.3.1+st.2/bin;C:/Users/zzr/AppData/Local/stm32cube/bundles/ninja/1.13.2+st.1/bin;$penv{PATH}"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "targets": ["stm32zet6"]
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "targets": ["stm32zet6"]
+    }
+  ]
+}
