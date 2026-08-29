@@ -35,7 +35,7 @@ extern "C" {
 /* USER CODE BEGIN Private defines */
 
 /* 四路数字红外避障/测距模块，OUT 低电平表示达到模块设定距离阈值。
- * PC4/PC5/PC8/PC9 分别使用 EXTI4/5/8/9，不与 RC、编码器或 SPI2 冲突。 */
+ * PC4/PC5/PC8/PC9 分别使用 EXTI4/5/8/9，不与 RC 或编码器引脚冲突。 */
 #define IR1_GPIO_Port         GPIOC
 #define IR1_Pin               GPIO_PIN_4
 #define IR2_GPIO_Port         GPIOC

@@ -16,8 +16,6 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include "imu_uart.h"
 /* USER CODE END Includes */
 
@@ -69,7 +67,6 @@ volatile uint32_t CH3_PulseWidth = 0;
 volatile uint32_t CH3_LastRise   = 0;
 volatile uint8_t  CH3_State      = 0;
 volatile uint32_t CH3_LastTick   = 0;
-volatile uint32_t CH3_RawPulseWidth = 0;
 static RcMedianFilter CH3_InputFilter = {0};
 
 /* CH4: PA7 */
@@ -115,17 +112,13 @@ static uint16_t Encoder4_LastCounter = 0;
 /* 最终写入 TIM1 CCR 的左右履带 PWM 脉宽，单位 us。 */
 volatile uint16_t RightTrackPwmUs = 1500;
 volatile uint16_t LeftTrackPwmUs = 1500;
-volatile int32_t LeftTrackSpeedCps = 0;
-volatile int32_t RightTrackSpeedCps = 0;
 
-/* 四路编码器用于速度遥测及直行时左右履带速度同步闭环。 */
+/* 四路编码器用于累计计数遥测及直行时左右履带速度同步闭环。 */
 static int32_t SpeedPrevEncoder1 = 0;
 static int32_t SpeedPrevEncoder2 = 0;
 static int32_t SpeedPrevEncoder3 = 0;
 static int32_t SpeedPrevEncoder4 = 0;
 static uint32_t SpeedLastTick = 0;
-static int32_t LeftSpeedDeltaFiltered = 0;
-static int32_t RightSpeedDeltaFiltered = 0;
 static int32_t LeftSpeedControlDeltaFiltered = 0;
 static int32_t RightSpeedControlDeltaFiltered = 0;
 static int32_t LeftTrackControlSpeedCps = 0;
@@ -140,8 +133,8 @@ uint32_t LastAttitudeUartTick = 0;
  * Tank drive mapping
  *   CH3 / PA3 : forward/reverse throttle command
  *   CH1 / PA6 : right stick horizontal, steering command
- *   PE9       : TIM1_CH1, right track ESC / motor controller
- *   PE11      : TIM1_CH2, left track ESC / motor controller
+ *   PE9       : TIM1_CH1, left track ESC / motor controller
+ *   PE11      : TIM1_CH2, right track ESC / motor controller
  *
  * The motor controllers must accept bidirectional RC PWM: 1500 us is stop,
  * 1000 us is full reverse, and 2000 us is full forward.
@@ -151,21 +144,16 @@ uint32_t LastAttitudeUartTick = 0;
 #define RC_OUTPUT_MAX_US          2000
 #define RC_INPUT_VALID_MIN_US     1000
 #define RC_INPUT_VALID_MAX_US     2100
-#define RC_DEADBAND_US              40
+#define RC_CH1_DEADBAND_US          85
+#define RC_CH3_DEADBAND_US          40
 /* 遥控器输入使用 7 点中值滤波：剔除最多连续三帧尖峰，真实阶跃
  * 连续四帧后通过；没有 IIR 拖尾。
  * 本机接收机实际输出不会低于 1000 us，低于 1000 的读数一律丢弃。 */
-/* 串口自动测试：T/R/L=1500~2000；R=/L= 可独立测试左右履带。 */
-#define SERIAL_TEST_TIMEOUT_MS      500
-#define SERIAL_TEST_MIN_US          1500
-#define SERIAL_TEST_MAX_US          2000
-#define SERIAL_RX_BUFFER_SIZE         64
 #define DEBUG_TELEMETRY_INTERVAL_MS  100
 #define ATTITUDE_UART_INTERVAL_MS      20
 
-/* 编码器速度：20 ms 采样；遥测使用较强滤波，闭环使用较快滤波。 */
+/* 编码器速度：20 ms 采样，闭环使用 1/2 低通抑制量化噪声。 */
 #define TRACK_SPEED_SAMPLE_INTERVAL_MS  20
-#define TRACK_SPEED_FILTER_DIV           16
 #define TRACK_SPEED_CONTROL_FILTER_DIV    2
 
 /*
@@ -185,36 +173,6 @@ static float TrackSpeedControlIntegral = 0.0f;
 static int32_t TrackSpeedCorrectionUs = 0;
 static uint32_t TrackSpeedControlLastSampleTick = 0U;
 
-#define YAW_HOLD_CONTROL_ENABLED          0
-
-#if YAW_HOLD_CONTROL_ENABLED
-/*
- * 航向保持：摇杆为直行时锁定进入直行瞬间的 yaw。每 40 ms 根据目标与
- * 当前 yaw 的误差，给两侧电调叠加等量反向 PWM，实现差速回正。
- * 正负方向取决于车体/陀螺仪安装方向；现场若越修越偏，将符号改为 1。
- */
-#define YAW_HOLD_UPDATE_INTERVAL_MS       40U
-#define YAW_HOLD_MIN_THROTTLE_US           0
-#define YAW_HOLD_DEADBAND_DEG           0.0f
-#define YAW_HOLD_KP_US_PER_DEG          2.5f
-#define YAW_HOLD_KI_US_PER_SAMPLE       0.05f
-#define YAW_HOLD_INTEGRAL_LIMIT        400.0f
-#define YAW_HOLD_MAX_CORRECTION_US      100
-/* 修正方向：右偏(yaw 减小, error>0)需右履带加快拉回左；
-   right += yc; left -= yc 下需 yc>0，故 SIGN=+1。
-   实测原值 -1 会让右偏时左履带加快、加剧右偏，故翻转。 */
-#define YAW_HOLD_CORRECTION_SIGN          (1)
-#define YAW_HOLD_EXIT_CONFIRM_MS        150U
-
-static uint8_t YawHoldActive = 0;
-static uint8_t YawHoldExitPending = 0;
-static float YawHoldTargetYaw = 0.0f;
-static float YawHoldIntegral = 0.0f;
-static int32_t YawHoldCorrectionUs = 0;
-static uint32_t YawHoldLastUpdateTick = 0;
-static uint32_t YawHoldExitSinceTick = 0;
-#endif
-
 /*
  * Two 3.87 m loaded runs were used to normalize each encoder to the same
  * physical-distance scale.  The reference scale is the average of ENC3/4.
@@ -225,7 +183,7 @@ static uint32_t YawHoldExitSinceTick = 0;
 #define ENC2_DISTANCE_SCALE               869
 #define ENC3_DISTANCE_SCALE              1013
 #define ENC4_DISTANCE_SCALE               988
-/* 实际同速样本的 LS/RS 总体比例约为 1.193；补偿 RS 后再进入 PID。 */
+/* 实际同速样本的左/右计数总体比例约为 1.193；补偿右侧后再进入 PI。 */
 #define TRACK_SPEED_REFERENCE_Q10        1024
 #define TRACK_RS_REFERENCE_Q10           1222
 
@@ -235,20 +193,6 @@ static uint32_t YawHoldExitSinceTick = 0;
 #define TANK_RIGHT_TRACK_REVERSED    0
 #define TANK_LEFT_TRACK_REVERSED     0
 #define TANK_STEERING_PRIORITY       1
-
-static uint8_t SerialTestMode = 0;
-static uint8_t SerialTestIndependentMode = 0;
-static uint16_t SerialTestThrottleUs = RC_OUTPUT_CENTER_US;
-static uint16_t SerialTestRightUs = RC_OUTPUT_CENTER_US;
-static uint16_t SerialTestLeftUs = RC_OUTPUT_CENTER_US;
-/* 由 USART1 接收中断刷新，避免主循环短暂阻塞误触发测试超时。 */
-static volatile uint32_t SerialTestLastRxTick = 0;
-static char SerialCommandBuffer[24];
-static uint8_t SerialCommandLength = 0;
-static uint8_t SerialRxByte = 0;
-static volatile uint8_t SerialRxBuffer[SERIAL_RX_BUFFER_SIZE];
-static volatile uint8_t SerialRxHead = 0;
-static volatile uint8_t SerialRxTail = 0;
 
 /* USER CODE END PV */
 
@@ -290,7 +234,7 @@ static int32_t AngleToUnsignedCentiDegrees(float angle)
 }
 
 /* Convert an RC pulse to a signed command around 0. Invalid/lost input stops. */
-static int32_t RcPulseToCommand(uint32_t pulse_us)
+static int32_t RcPulseToCommand(uint32_t pulse_us, int32_t deadband_us)
 {
   int32_t command;
 
@@ -300,7 +244,7 @@ static int32_t RcPulseToCommand(uint32_t pulse_us)
   }
 
   command = (int32_t)pulse_us - RC_OUTPUT_CENTER_US;
-  if ((command >= -RC_DEADBAND_US) && (command <= RC_DEADBAND_US))
+  if ((command >= -deadband_us) && (command <= deadband_us))
   {
     return 0;
   }
@@ -371,292 +315,12 @@ static void RefreshInfraredInputs(void)
   }
 }
 
-#if YAW_HOLD_CONTROL_ENABLED
-/* 将目标和当前 yaw 的差值归一化到 [-180, 180] 度，避免跨 ±180 度时误差跳变。 */
-static float NormalizeYawError(float error)
-{
-  while (error > 180.0f) error -= 360.0f;
-  while (error < -180.0f) error += 360.0f;
-  return error;
-}
-
-static void DisableYawHold(uint32_t now)
-{
-  YawHoldActive = 0U;
-  YawHoldExitPending = 0U;
-  YawHoldIntegral = 0.0f;
-  YawHoldCorrectionUs = 0;
-  /* Do not leave an old target in telemetry after the hold session ends. */
-  YawHoldTargetYaw = imu_yaw;
-  YawHoldLastUpdateTick = now;
-  YawHoldExitSinceTick = now;
-}
-
-/*
- * 直行航向 PI 环。输出定义为物理右履带的 PWM 增量，左履带始终取反；
- * 因此无论是前进还是倒车，同一个正输出都使车辆产生同一方向的偏航力矩。
- */
-static int32_t UpdateYawHold(int32_t throttle, int32_t steering, uint32_t now)
-{
-  uint8_t straight_command;
-  int32_t throttle_magnitude;
-  float error;
-  float candidate_integral;
-  float raw_correction;
-  int32_t correction_limit;
-
-  throttle_magnitude = (throttle < 0) ? -throttle : throttle;
-  straight_command = (throttle_magnitude > YAW_HOLD_MIN_THROTTLE_US) &&
-                     (steering == 0);
-  if (!straight_command)
-  {
-    if (!YawHoldActive)
-    {
-      DisableYawHold(now);
-      return 0;
-    }
-
-    /* CH1 中位附近的单帧抖动不应让 YAW_HOLD 变成 0101；持续转向
-     * 超过确认时间后才结束本次直行会话。确认期间不输出 yaw 差速。 */
-    if (!YawHoldExitPending)
-    {
-      YawHoldExitPending = 1U;
-      YawHoldExitSinceTick = now;
-    }
-    YawHoldCorrectionUs = 0;
-    if ((now - YawHoldExitSinceTick) < YAW_HOLD_EXIT_CONFIRM_MS)
-    {
-      return 0;
-    }
-    DisableYawHold(now);
-    return 0;
-  }
-  YawHoldExitPending = 0U;
-
-  /* 只要直行指令没有结束，IMU 掉线期间也永远保留原目标角，不重新
-   * 捕获恢复瞬间的跳变 yaw。掉线期间把差速修正归零，避免用旧修正
-   * 持续带偏车辆；传感器恢复后继续对原目标角闭环。 */
-  if (!IMU_UART_IsReady())
-  {
-    if (!YawHoldActive)
-    {
-      return 0;
-    }
-    YawHoldCorrectionUs = 0;
-    YawHoldLastUpdateTick = now;
-    return 0;
-  }
-  if (!YawHoldActive)
-  {
-    /* 只在每一次进入直行时锁一次角度，不随当前 yaw 漂移目标。 */
-    YawHoldActive = 1U;
-    YawHoldTargetYaw = imu_yaw;
-    YawHoldIntegral = 0.0f;
-    YawHoldCorrectionUs = 0;
-    YawHoldLastUpdateTick = now;
-    return 0;
-  }
-
-  if ((now - YawHoldLastUpdateTick) < YAW_HOLD_UPDATE_INTERVAL_MS)
-  {
-    return YawHoldCorrectionUs;
-  }
-  YawHoldLastUpdateTick = now;
-
-  error = NormalizeYawError(YawHoldTargetYaw - imu_yaw);
-  if ((error > -YAW_HOLD_DEADBAND_DEG) && (error < YAW_HOLD_DEADBAND_DEG))
-  {
-    error = 0.0f;
-  }
-
-  candidate_integral = YawHoldIntegral + error;
-  if (candidate_integral > YAW_HOLD_INTEGRAL_LIMIT)
-  {
-    candidate_integral = YAW_HOLD_INTEGRAL_LIMIT;
-  }
-  else if (candidate_integral < -YAW_HOLD_INTEGRAL_LIMIT)
-  {
-    candidate_integral = -YAW_HOLD_INTEGRAL_LIMIT;
-  }
-
-  raw_correction = (float)YAW_HOLD_CORRECTION_SIGN *
-                   (YAW_HOLD_KP_US_PER_DEG * error +
-                    YAW_HOLD_KI_US_PER_SAMPLE * candidate_integral);
-  /* Keep yaw correction enabled even at full throttle. The final PWM command
-     is clamped independently; disabling the limit here made correction_limit
-     zero when throttle_magnitude was 500 (2000 us), so YAW_PID stayed zero. */
-  correction_limit = YAW_HOLD_MAX_CORRECTION_US;
-
-  /* 输出受限时冻结积分，避免满油门或大偏差下出现积分饱和。 */
-  if (raw_correction > (float)correction_limit)
-  {
-    YawHoldCorrectionUs = correction_limit;
-  }
-  else if (raw_correction < -(float)correction_limit)
-  {
-    YawHoldCorrectionUs = -correction_limit;
-  }
-  else
-  {
-    YawHoldIntegral = candidate_integral;
-    YawHoldCorrectionUs = (raw_correction >= 0.0f) ?
-                          (int32_t)(raw_correction + 0.5f) :
-                          (int32_t)(raw_correction - 0.5f);
-  }
-  return YawHoldCorrectionUs;
-}
-#endif
-
-static void SerialTestReply(const char *text)
-{
-  /* USART1 的 TX 保持纯四编码器 CSV；测试命令仍可接收，但不混入文字回包。 */
-  (void)text;
-}
-
-static void SerialTestExecuteCommand(void)
-{
-  unsigned long requested_us;
-  char *end_ptr;
-  uint16_t *independent_value = NULL;
-
-  if (strncmp(SerialCommandBuffer, "T=", 2) == 0)
-  {
-    requested_us = strtoul(&SerialCommandBuffer[2], &end_ptr, 10);
-    if ((*end_ptr == '\0') &&
-        (requested_us >= SERIAL_TEST_MIN_US) &&
-        (requested_us <= SERIAL_TEST_MAX_US))
-    {
-      SerialTestThrottleUs = (uint16_t)requested_us;
-      SerialTestIndependentMode = 0;
-      SerialTestMode = 1;
-      SerialTestReply("TEST_OK\r\n");
-    }
-    else
-    {
-      SerialTestThrottleUs = RC_OUTPUT_CENTER_US;
-      SerialTestIndependentMode = 0;
-      SerialTestMode = 1;
-      SerialTestReply("TEST_RANGE\r\n");
-    }
-  }
-  else if ((SerialCommandBuffer[0] == 'R') &&
-           (SerialCommandBuffer[1] == '='))
-  {
-    independent_value = &SerialTestRightUs;
-  }
-  else if ((SerialCommandBuffer[0] == 'L') &&
-           (SerialCommandBuffer[1] == '='))
-  {
-    independent_value = &SerialTestLeftUs;
-  }
-
-  if (independent_value != NULL)
-  {
-    requested_us = strtoul(&SerialCommandBuffer[2], &end_ptr, 10);
-    if ((*end_ptr == '\0') &&
-        (requested_us >= SERIAL_TEST_MIN_US) &&
-        (requested_us <= SERIAL_TEST_MAX_US))
-    {
-      *independent_value = (uint16_t)requested_us;
-      SerialTestIndependentMode = 1;
-      SerialTestMode = 1;
-      SerialTestReply("TEST_SIDE_OK\r\n");
-    }
-    else
-    {
-      SerialTestRightUs = RC_OUTPUT_CENTER_US;
-      SerialTestLeftUs = RC_OUTPUT_CENTER_US;
-      SerialTestIndependentMode = 1;
-      SerialTestMode = 1;
-      SerialTestReply("TEST_RANGE\r\n");
-    }
-  }
-  else if (strcmp(SerialCommandBuffer, "STOP") == 0)
-  {
-    SerialTestThrottleUs = RC_OUTPUT_CENTER_US;
-    SerialTestRightUs = RC_OUTPUT_CENTER_US;
-    SerialTestLeftUs = RC_OUTPUT_CENTER_US;
-    SerialTestIndependentMode = 1;
-    SerialTestMode = 1;
-    SerialTestReply("TEST_STOP\r\n");
-  }
-  else if (strcmp(SerialCommandBuffer, "LIVE") == 0)
-  {
-    SerialTestThrottleUs = RC_OUTPUT_CENTER_US;
-    SerialTestRightUs = RC_OUTPUT_CENTER_US;
-    SerialTestLeftUs = RC_OUTPUT_CENTER_US;
-    SerialTestIndependentMode = 0;
-    SerialTestMode = 0;
-    SerialTestReply("TEST_LIVE\r\n");
-  }
-}
-
-static void ApplyIndependentTrackPwm(void)
-{
-  /* 实测 PE9/CH1 接左履带，PE11/CH2 接右履带。 */
-  CommitTrackPwm(SerialTestLeftUs, SerialTestRightUs);
-}
-
-/* 将中断接收的字节组装为测试命令；主循环中执行命令，避免在中断内发串口。 */
-static void SerialTestPoll(void)
-{
-  uint8_t byte;
-
-  while (SerialRxTail != SerialRxHead)
-  {
-    byte = SerialRxBuffer[SerialRxTail];
-    SerialRxTail = (uint8_t)((SerialRxTail + 1U) &
-                             (SERIAL_RX_BUFFER_SIZE - 1U));
-    if (byte == '\r')
-    {
-      continue;
-    }
-    if (byte == '\n')
-    {
-      SerialCommandBuffer[SerialCommandLength] = '\0';
-      if (SerialCommandLength != 0U)
-      {
-        SerialTestExecuteCommand();
-      }
-      SerialCommandLength = 0;
-    }
-    else if (SerialCommandLength < (sizeof(SerialCommandBuffer) - 1U))
-    {
-      SerialCommandBuffer[SerialCommandLength++] = (char)byte;
-    }
-    else
-    {
-      SerialCommandLength = 0;
-    }
-  }
-}
-
-/* USART1 每收到一个字节即入环形缓冲，遥测发送期间也不会丢失上位机命令。 */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-  uint8_t next_head;
-
   if (huart->Instance == USART2)
   {
     IMU_UART_HandleRxComplete(huart);
-    return;
   }
-
-  if (huart->Instance != USART1)
-  {
-    return;
-  }
-
-  next_head = (uint8_t)((SerialRxHead + 1U) & (SERIAL_RX_BUFFER_SIZE - 1U));
-  if (next_head != SerialRxTail)
-  {
-    SerialRxBuffer[SerialRxHead] = SerialRxByte;
-    SerialRxHead = next_head;
-    /* 测试保活以“命令已到达”为准，命令解析可在主循环恢复后完成。 */
-    SerialTestLastRxTick = HAL_GetTick();
-  }
-
-  (void)HAL_UART_Receive_IT(&huart1, &SerialRxByte, 1U);
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
@@ -789,11 +453,12 @@ static int32_t CalibrateEncoderDelta(int32_t delta, int32_t scale)
 }
 
 /*
- * ENC1/ENC2 are the physical right track encoders; ENC3/ENC4 are the
- * physical left track encoders.
+ * Physical straight-run evidence: ENC1/ENC2 are the left-track encoders;
+ * ENC3/ENC4 are the right-track encoders. Forward raw counts have opposite
+ * signs between sides, so speed magnitude intentionally uses AbsI32().
  * 使用每个采样周期的脉冲增量而不是累计位置，避免累计值不同造成误判。
  */
-static void UpdateTrackSpeedTelemetry(uint32_t now)
+static void UpdateTrackSpeedMeasurement(uint32_t now)
 {
   uint32_t elapsed;
   int32_t delta1;
@@ -824,19 +489,18 @@ static void UpdateTrackSpeedTelemetry(uint32_t now)
    * physical distance here: the two 3.87 m calibration runs measured about
    * 22007.9/20111.4/17250.1/17690.6 counts per metre for ENC1..ENC4.
    */
-  right_delta = (CalibrateEncoderDelta(delta1, ENC1_DISTANCE_SCALE) +
-                 CalibrateEncoderDelta(delta2, ENC2_DISTANCE_SCALE)) / 2;
-  left_delta = (CalibrateEncoderDelta(delta3, ENC3_DISTANCE_SCALE) +
-                CalibrateEncoderDelta(delta4, ENC4_DISTANCE_SCALE)) / 2;
+  left_delta = (CalibrateEncoderDelta(delta1, ENC1_DISTANCE_SCALE) +
+                CalibrateEncoderDelta(delta2, ENC2_DISTANCE_SCALE)) / 2;
+  right_delta = (CalibrateEncoderDelta(delta3, ENC3_DISTANCE_SCALE) +
+                 CalibrateEncoderDelta(delta4, ENC4_DISTANCE_SCALE)) / 2;
 
-  /* 以实测实际同速时 LS/RS 的比例修正右侧速度遥测，使 LS/RS 可直接
-   * 比较真实履带线速度，而不是比较原始编码器归一化后的数值。 */
+  /* 以实测实际同速时的左右计数比例修正右侧速度，再进入同步 PI。 */
   right_delta = (right_delta * TRACK_RS_REFERENCE_Q10) /
                 TRACK_SPEED_REFERENCE_Q10;
 
   /*
    * 先把各周期增量归一化到固定采样周期基准，再做低通。
-   * 直接滤波原始增量时，主循环偶发延迟（串口/MPU 阻塞）会让 elapsed
+   * 直接滤波原始增量时，主循环偶发延迟（阻塞式串口发送等）会让 elapsed
    * 变成 60~100 ms，delta 随之翻倍而低通滞后，速度=滤波增量/elapsed
    * 会整段假跳变（实测 PWM 恒定而速度读数 8800→3638→9450 乱跳）。
    * 归一化后速度与滤波误差都不再随周期长度变化。
@@ -844,17 +508,7 @@ static void UpdateTrackSpeedTelemetry(uint32_t now)
   left_delta = (left_delta * (int32_t)TRACK_SPEED_SAMPLE_INTERVAL_MS) / (int32_t)elapsed;
   right_delta = (right_delta * (int32_t)TRACK_SPEED_SAMPLE_INTERVAL_MS) / (int32_t)elapsed;
 
-  /* 编码器周期增量含有量化噪声，使用 1/16 低通稳定速度遥测。 */
-  LeftSpeedDeltaFiltered +=
-      (left_delta - LeftSpeedDeltaFiltered) / TRACK_SPEED_FILTER_DIV;
-  RightSpeedDeltaFiltered +=
-      (right_delta - RightSpeedDeltaFiltered) / TRACK_SPEED_FILTER_DIV;
-  LeftTrackSpeedCps =
-      (LeftSpeedDeltaFiltered * 1000) / (int32_t)TRACK_SPEED_SAMPLE_INTERVAL_MS;
-  RightTrackSpeedCps =
-      (RightSpeedDeltaFiltered * 1000) / (int32_t)TRACK_SPEED_SAMPLE_INTERVAL_MS;
-
-  /* 闭环测速使用 1/2 低通，响应约 40 ms；串口显示仍保留 1/16 滤波。 */
+  /* 闭环测速使用 1/2 低通，响应约 40 ms。 */
   LeftSpeedControlDeltaFiltered +=
       (left_delta - LeftSpeedControlDeltaFiltered) / TRACK_SPEED_CONTROL_FILTER_DIV;
   RightSpeedControlDeltaFiltered +=
@@ -883,8 +537,8 @@ static uint8_t RcControlsAreCentered(void)
 {
   return ((RcPulseIsValid(CH1_PulseWidth) != 0U) &&
           (RcPulseIsValid(CH3_PulseWidth) != 0U) &&
-          (RcPulseToCommand(CH1_PulseWidth) == 0) &&
-          (RcPulseToCommand(CH3_PulseWidth) == 0)) ? 1U : 0U;
+          (RcPulseToCommand(CH1_PulseWidth, RC_CH1_DEADBAND_US) == 0) &&
+          (RcPulseToCommand(CH3_PulseWidth, RC_CH3_DEADBAND_US) == 0)) ? 1U : 0U;
 }
 
 static void UpdateInfraredInterlock(void)
@@ -896,8 +550,7 @@ static void UpdateInfraredInterlock(void)
   else if ((EmergencyStopLatched != 0U) &&
            (RcControlsAreCentered() != 0U))
   {
-    /* 障碍解除后必须先把油门和转向都回中一次；锁存立即解除，
-     * 随后的下一次推杆才形成新的控制命令。 */
+    /* 障碍解除后必须先把油门和转向都回中一次；随后重新推杆才运动。 */
     EmergencyStopLatched = 0U;
   }
 }
@@ -1001,8 +654,8 @@ static int32_t UpdateTrackSpeedControl(int32_t throttle, int32_t steering)
  */
 static void UpdateTankDrive(uint32_t throttle_pulse_us, uint32_t steering_pulse_us)
 {
-  int32_t throttle = RcPulseToCommand(throttle_pulse_us);
-  int32_t steering = RcPulseToCommand(steering_pulse_us);
+  int32_t throttle = RcPulseToCommand(throttle_pulse_us, RC_CH3_DEADBAND_US);
+  int32_t steering = RcPulseToCommand(steering_pulse_us, RC_CH1_DEADBAND_US);
   int32_t right_command;
   int32_t left_command;
   int32_t speed_correction;
@@ -1098,9 +751,8 @@ int main(void)
   MX_TIM8_Init();
   /* USER CODE BEGIN 2 */
 
-  /* USART2 (remapped to PD5/PD6) nine-axis IMU is optional: a missing sensor must not stop vehicle control. */
+  /* USART2 (remapped to PD6 RX) IMU is optional: a missing sensor must not stop vehicle control. */
   (void)IMU_UART_Init();
-  (void)IMU_UART_RequestVersion();
 
   /* 启动 TIM1 CH1/CH2 PWM 输出 */
   /* Start both ESC/motor-controller outputs at their neutral pulse width. */
@@ -1139,11 +791,6 @@ int main(void)
   SpeedPrevEncoder3 = 0;
   SpeedPrevEncoder4 = 0;
   SpeedLastTick = HAL_GetTick();
-  /* 以中断持续接收上位机命令，避免调试打印占用时遗漏字节。 */
-  if (HAL_UART_Receive_IT(&huart1, &SerialRxByte, 1U) != HAL_OK)
-  {
-    Error_Handler();
-  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -1154,54 +801,36 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     uint32_t now = HAL_GetTick();
-    uint32_t throttle_pulse;
-    uint32_t steering_pulse;
-
     RefreshInfraredInputs();
-    IMU_UART_Process(now);
-    SerialTestPoll();
-    if (SerialTestMode && ((now - SerialTestLastRxTick) > SERIAL_TEST_TIMEOUT_MS))
-    {
-      SerialTestThrottleUs = RC_OUTPUT_CENTER_US;
-      SerialTestRightUs = RC_OUTPUT_CENTER_US;
-      SerialTestLeftUs = RC_OUTPUT_CENTER_US;
-    }
+    IMU_UART_Process();
 
     UpdateEncoderCounters();
-    UpdateTrackSpeedTelemetry(now);
+    UpdateTrackSpeedMeasurement(now);
 
-    /* 只保留红外急停锁存：障碍解除后先回中一次，再接受新的推杆命令。 */
+    /* 仅保留红外急停锁存；障碍解除后先回中，再接受新的推杆命令。 */
     UpdateInfraredInterlock();
 
-    /* 红外锁存优先级最高；解除前禁止 RC、串口测试和闭环覆盖中位。 */
+    /* 红外锁存优先级最高；解除前禁止遥控和闭环覆盖中位。 */
     if (EmergencyStopActive || EmergencyStopLatched)
     {
       ResetTrackSpeedControl();
       CommitTrackPwm(RC_OUTPUT_CENTER_US, RC_OUTPUT_CENTER_US);
     }
-    else if (SerialTestMode && SerialTestIndependentMode)
-    {
-      /* 独立扫档时不允许速度环保留和介入。 */
-      ResetTrackSpeedControl();
-      ApplyIndependentTrackPwm();
-    }
     else
     {
-      throttle_pulse = SerialTestMode ? SerialTestThrottleUs : CH3_PulseWidth;
-      steering_pulse = SerialTestMode ? RC_OUTPUT_CENTER_US : CH1_PulseWidth;
-
       /* CH3 controls forward/reverse; CH1 remains the steering input. */
-       UpdateTankDrive(throttle_pulse, steering_pulse);
+      UpdateTankDrive(CH3_PulseWidth, CH1_PulseWidth);
     }
 
     /* USART1/PA9 telemetry CSV (115200 8N1):
-       CH1,CH2,CH3,CH4,CH5,CH6,LPWM,RPWM.
+       CH1,CH2,CH3,CH4,CH5,CH6,LPWM,RPWM,ENC1,ENC2,ENC3,ENC4.
        CH1..CH6 are the filtered receiver pulse widths in us. LPWM/RPWM are
-       the actual PWM pulse widths in us committed to the left/right ESC. */
+       the actual PWM pulse widths in us committed to the left/right ESC.
+       ENC1..ENC4 are signed accumulated quadrature counts. */
     if ((now - LastDebugTick) >= DEBUG_TELEMETRY_INTERVAL_MS)
     {
       int n = sprintf(dbg_buf,
-                      "%lu,%lu,%lu,%lu,%lu,%lu,%u,%u\r\n",
+                      "%lu,%lu,%lu,%lu,%lu,%lu,%u,%u,%ld,%ld,%ld,%ld\r\n",
                       (unsigned long)CH1_PulseWidth,
                       (unsigned long)CH2_PulseWidth,
                       (unsigned long)CH3_PulseWidth,
@@ -1209,7 +838,11 @@ int main(void)
                       (unsigned long)CH5_PulseWidth,
                       (unsigned long)CH6_PulseWidth,
                       (unsigned int)LeftTrackPwmUs,
-                      (unsigned int)RightTrackPwmUs);
+                      (unsigned int)RightTrackPwmUs,
+                      (long)Encoder1_Count,
+                      (long)Encoder2_Count,
+                      (long)Encoder3_Count,
+                      (long)Encoder4_Count);
       HAL_UART_Transmit(&huart1, (uint8_t *)dbg_buf, n, 20);
       LastDebugTick = now;
     }
@@ -1303,7 +936,6 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
       RcCaptureEdge(&CH3_PulseWidth, &CH3_InputFilter,
                     &CH3_LastRise, &CH3_State, &CH3_LastTick,
                     GPIOA, GPIO_PIN_3);
-      CH3_RawPulseWidth = CH3_PulseWidth;
       break;
     case GPIO_PIN_4:
       IR1_Detected = (HAL_GPIO_ReadPin(IR1_GPIO_Port, IR1_Pin) == GPIO_PIN_RESET);
