@@ -124,9 +124,9 @@ static int32_t RightSpeedControlDeltaFiltered = 0;
 static int32_t LeftTrackControlSpeedCps = 0;
 static int32_t RightTrackControlSpeedCps = 0;
 
-char dbg_buf[448];
+char dbg_buf[64];
 uint32_t LastDebugTick = 0;
-char attitude_buf[128];
+char attitude_buf[64];
 uint32_t LastAttitudeUartTick = 0;
 
 /*
@@ -151,6 +151,22 @@ uint32_t LastAttitudeUartTick = 0;
  * 本机接收机实际输出不会低于 1000 us，低于 1000 的读数一律丢弃。 */
 #define DEBUG_TELEMETRY_INTERVAL_MS  100
 #define ATTITUDE_UART_INTERVAL_MS      20
+
+/* IMU heading hold: PI differential correction with verified sign. */
+#define IMU_ATTITUDE_TIMEOUT_MS                   100U
+#define YAW_HOLD_MIN_THROTTLE_US                    60
+#define YAW_HOLD_KP_US_PER_DEG                      6.0f
+#define YAW_HOLD_KI_US_PER_DEG_SECOND               2.0f
+#define YAW_HOLD_ERROR_DEADBAND_DEG                  0.3f
+#define YAW_HOLD_INTEGRAL_LIMIT_US                  24.0f
+#define YAW_HOLD_MAX_CORRECTION_US                   60
+static uint8_t ImuAttitudeFresh = 0U;
+static uint8_t YawHoldActive = 0U;
+static float YawHoldTargetDeg = 0.0f;
+static float YawHoldErrorDeg = 0.0f;
+static float YawHoldIntegralUs = 0.0f;
+static int32_t YawHoldCorrectionUs = 0;
+static uint32_t YawHoldLastUpdateTick = 0U;
 
 /* 编码器速度：20 ms 采样，闭环使用 1/2 低通抑制量化噪声。 */
 #define TRACK_SPEED_SAMPLE_INTERVAL_MS  20
@@ -447,6 +463,131 @@ static int32_t AbsI32(int32_t value)
   return (value < 0) ? -value : value;
 }
 
+static float NormalizeYawDegrees(float yaw)
+{
+  while (yaw < 0.0f) yaw += 360.0f;
+  while (yaw >= 360.0f) yaw -= 360.0f;
+  return yaw;
+}
+
+static float WrapYawErrorDegrees(float error)
+{
+  while (error > 180.0f) error -= 360.0f;
+  while (error < -180.0f) error += 360.0f;
+  return error;
+}
+
+static void ResetYawHold(void)
+{
+  YawHoldActive = 0U;
+  YawHoldTargetDeg = 0.0f;
+  YawHoldErrorDeg = 0.0f;
+  YawHoldIntegralUs = 0.0f;
+  YawHoldCorrectionUs = 0;
+  YawHoldLastUpdateTick = 0U;
+}
+
+/*
+ * Capture the current heading when straight driving starts, then calculate a
+ * PI differential correction. Physical evidence confirmed that a right
+ * deviation decreases Yaw, so positive error must speed up the right track
+ * and slow down the left track to steer back left. The integral term learns
+ * the static left/right PWM bias required to hold the requested heading.
+ */
+static void UpdateYawHold(uint32_t now)
+{
+  int32_t throttle = RcPulseToCommand(CH3_PulseWidth, RC_CH3_DEADBAND_US);
+  int32_t steering = RcPulseToCommand(CH1_PulseWidth, RC_CH1_DEADBAND_US);
+  uint32_t elapsed_ms;
+  float proportional_us;
+  float integral_delta_us;
+  float raw_correction;
+
+  ImuAttitudeFresh =
+      ((imu_attitude_valid != 0U) &&
+       ((now - imu_attitude_last_tick) <= IMU_ATTITUDE_TIMEOUT_MS)) ? 1U : 0U;
+
+  if ((ImuAttitudeFresh == 0U) ||
+      (EmergencyStopActive != 0U) ||
+      (EmergencyStopLatched != 0U) ||
+      (AbsI32(throttle) < YAW_HOLD_MIN_THROTTLE_US) ||
+      (steering != 0))
+  {
+    ResetYawHold();
+    return;
+  }
+
+  if (YawHoldActive == 0U)
+  {
+    YawHoldTargetDeg = NormalizeYawDegrees(imu_yaw);
+    YawHoldIntegralUs = 0.0f;
+    YawHoldLastUpdateTick = now;
+    YawHoldActive = 1U;
+    return;
+  }
+
+  elapsed_ms = now - YawHoldLastUpdateTick;
+  YawHoldLastUpdateTick = now;
+
+  YawHoldErrorDeg =
+      WrapYawErrorDegrees(YawHoldTargetDeg -
+                          NormalizeYawDegrees(imu_yaw));
+
+  if ((YawHoldErrorDeg <= YAW_HOLD_ERROR_DEADBAND_DEG) &&
+      (YawHoldErrorDeg >= -YAW_HOLD_ERROR_DEADBAND_DEG))
+  {
+    YawHoldErrorDeg = 0.0f;
+  }
+
+  proportional_us = YawHoldErrorDeg * YAW_HOLD_KP_US_PER_DEG;
+  raw_correction = proportional_us + YawHoldIntegralUs;
+
+  /*
+   * Time-based integral removes the steady heading error left by P control.
+   * Conditional integration prevents windup while the total output is
+   * saturated, but still permits an opposite error to unwind the integral.
+   */
+  if (elapsed_ms > 0U)
+  {
+    integral_delta_us =
+        YawHoldErrorDeg * YAW_HOLD_KI_US_PER_DEG_SECOND *
+        ((float)elapsed_ms / 1000.0f);
+
+    if (((raw_correction < (float)YAW_HOLD_MAX_CORRECTION_US) &&
+         (raw_correction > -(float)YAW_HOLD_MAX_CORRECTION_US)) ||
+        ((raw_correction >= (float)YAW_HOLD_MAX_CORRECTION_US) &&
+         (integral_delta_us < 0.0f)) ||
+        ((raw_correction <= -(float)YAW_HOLD_MAX_CORRECTION_US) &&
+         (integral_delta_us > 0.0f)))
+    {
+      YawHoldIntegralUs += integral_delta_us;
+      if (YawHoldIntegralUs > YAW_HOLD_INTEGRAL_LIMIT_US)
+      {
+        YawHoldIntegralUs = YAW_HOLD_INTEGRAL_LIMIT_US;
+      }
+      else if (YawHoldIntegralUs < -YAW_HOLD_INTEGRAL_LIMIT_US)
+      {
+        YawHoldIntegralUs = -YAW_HOLD_INTEGRAL_LIMIT_US;
+      }
+    }
+  }
+
+  raw_correction = proportional_us + YawHoldIntegralUs;
+  if (raw_correction > (float)YAW_HOLD_MAX_CORRECTION_US)
+  {
+    raw_correction = (float)YAW_HOLD_MAX_CORRECTION_US;
+  }
+  else if (raw_correction < -(float)YAW_HOLD_MAX_CORRECTION_US)
+  {
+    raw_correction = -(float)YAW_HOLD_MAX_CORRECTION_US;
+  }
+
+  YawHoldCorrectionUs =
+      (raw_correction >= 0.0f) ?
+      (int32_t)(raw_correction + 0.5f) :
+      (int32_t)(raw_correction - 0.5f);
+}
+
 static int32_t CalibrateEncoderDelta(int32_t delta, int32_t scale)
 {
   return (AbsI32(delta) * scale) / TRACK_ENCODER_SCALE;
@@ -687,14 +828,29 @@ static void UpdateTankDrive(uint32_t throttle_pulse_us, uint32_t steering_pulse_
   left_command  = throttle + steering;
 #endif
 
-  /*
-   * 速度同步修正的是履带速度幅值：前进时正修正增加右 PWM，倒车时正修正
-   * 减小右 PWM（让右侧反向幅值更大）。左右等量反向叠加，不改变平均油门。
-   */
-  speed_correction = UpdateTrackSpeedControl(throttle, steering);
-  drive_direction = (throttle >= 0) ? 1 : -1;
-  right_command += drive_direction * speed_correction;
-  left_command  -= drive_direction * speed_correction;
+  if (YawHoldActive != 0U)
+  {
+    /*
+     * The encoder PI drives left/right speed error toward zero and would
+     * oppose an intentional heading differential. Keep one controller active
+     * at a time. Heading correction sign is independent of travel direction
+     * because it controls signed yaw rate, not track speed magnitude.
+     */
+    ResetTrackSpeedControl();
+    right_command += YawHoldCorrectionUs;
+    left_command  -= YawHoldCorrectionUs;
+  }
+  else
+  {
+    /*
+     * 速度同步修正的是履带速度幅值：前进时正修正增加右 PWM，倒车时正修正
+     * 减小右 PWM（让右侧反向幅值更大）。左右等量反向叠加，不改变平均油门。
+     */
+    speed_correction = UpdateTrackSpeedControl(throttle, steering);
+    drive_direction = (throttle >= 0) ? 1 : -1;
+    right_command += drive_direction * speed_correction;
+    left_command  -= drive_direction * speed_correction;
+  }
 
 #if TANK_RIGHT_TRACK_REVERSED
   right_command = -right_command;
@@ -809,6 +965,8 @@ int main(void)
 
     /* 仅保留红外急停锁存；障碍解除后先回中，再接受新的推杆命令。 */
     UpdateInfraredInterlock();
+    now = HAL_GetTick();
+    UpdateYawHold(now);
 
     /* 红外锁存优先级最高；解除前禁止遥控和闭环覆盖中位。 */
     if (EmergencyStopActive || EmergencyStopLatched)
@@ -822,23 +980,11 @@ int main(void)
       UpdateTankDrive(CH3_PulseWidth, CH1_PulseWidth);
     }
 
-    /* USART1/PA9 telemetry CSV (115200 8N1):
-       CH1,CH2,CH3,CH4,CH5,CH6,LPWM,RPWM,ENC1,ENC2,ENC3,ENC4.
-       CH1..CH6 are the filtered receiver pulse widths in us. LPWM/RPWM are
-       the actual PWM pulse widths in us committed to the left/right ESC.
-       ENC1..ENC4 are signed accumulated quadrature counts. */
+    /* USART1/PA9 encoder CSV (115200 8N1): ENC1,ENC2,ENC3,ENC4. */
     if ((now - LastDebugTick) >= DEBUG_TELEMETRY_INTERVAL_MS)
     {
       int n = sprintf(dbg_buf,
-                      "%lu,%lu,%lu,%lu,%lu,%lu,%u,%u,%ld,%ld,%ld,%ld\r\n",
-                      (unsigned long)CH1_PulseWidth,
-                      (unsigned long)CH2_PulseWidth,
-                      (unsigned long)CH3_PulseWidth,
-                      (unsigned long)CH4_PulseWidth,
-                      (unsigned long)CH5_PulseWidth,
-                      (unsigned long)CH6_PulseWidth,
-                      (unsigned int)LeftTrackPwmUs,
-                      (unsigned int)RightTrackPwmUs,
+                      "%ld,%ld,%ld,%ld\r\n",
                       (long)Encoder1_Count,
                       (long)Encoder2_Count,
                       (long)Encoder3_Count,
@@ -847,8 +993,7 @@ int main(void)
       LastDebugTick = now;
     }
 
-    /* USART3/PB10：固定周期只输出三轴姿态角 Yaw,Pitch,Roll。
-       首帧到达前会输出 3 个 0，避免串口静默而无法区分“没发送”和“没回帧”。 */
+    /* USART3/PB10 attitude CSV: Yaw,Pitch,Roll. */
     if ((now - LastAttitudeUartTick) >= ATTITUDE_UART_INTERVAL_MS)
     {
       int32_t yaw_cd = AngleToUnsignedCentiDegrees(imu_yaw);

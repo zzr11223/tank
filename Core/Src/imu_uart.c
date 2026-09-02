@@ -24,6 +24,8 @@ enum
 float imu_yaw = 0.0f;
 float imu_pitch = 0.0f;
 float imu_roll = 0.0f;
+uint32_t imu_attitude_last_tick = 0U;
+uint8_t imu_attitude_valid = 0U;
 
 static uint8_t imu_uart_rx_byte;
 static volatile uint8_t imu_rx_buffer[IMU_UART_RX_BUFFER_SIZE];
@@ -103,6 +105,8 @@ static void IMU_UART_ParseFrame(uint8_t function,
       imu_roll = roll * IMU_UART_RAD_TO_DEG;
       imu_pitch = pitch * IMU_UART_RAD_TO_DEG;
       imu_yaw = yaw * IMU_UART_RAD_TO_DEG;
+      imu_attitude_last_tick = HAL_GetTick();
+      imu_attitude_valid = 1U;
     }
   }
 }
@@ -112,6 +116,8 @@ HAL_StatusTypeDef IMU_UART_Init(void)
   imu_yaw = 0.0f;
   imu_pitch = 0.0f;
   imu_roll = 0.0f;
+  imu_attitude_last_tick = 0U;
+  imu_attitude_valid = 0U;
   imu_rx_head = 0U;
   imu_rx_tail = 0U;
   parser_state = IMU_RX_WAIT_HEAD1;

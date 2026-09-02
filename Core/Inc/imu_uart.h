@@ -12,10 +12,12 @@ extern "C" {
 #define IMU_UART_FRAME_HEAD2       0x23U
 #define IMU_UART_FUNC_EULER        0x26U
 
-/* Euler angles used only by USART3 attitude telemetry, not vehicle control. */
+/* Euler angles and validity evidence used by heading hold and USART3 telemetry. */
 extern float imu_yaw;
 extern float imu_pitch;
 extern float imu_roll;
+extern uint32_t imu_attitude_last_tick;
+extern uint8_t imu_attitude_valid;
 
 HAL_StatusTypeDef IMU_UART_Init(void);
 void IMU_UART_Process(void);
